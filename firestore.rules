@@ -1,0 +1,287 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------
+    // Global Safety Helpers
+    // -------------------------------------------------------------
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // -------------------------------------------------------------
+    // Domain Entity Validation Blueprints
+    // -------------------------------------------------------------
+
+    // Products: Validates name, positive price and valid barcode
+    function isValidProducto(data) {
+      return data.nombre is string 
+        && data.nombre.size() > 0 
+        && data.nombre.size() <= 200
+        && data.precio is number 
+        && data.precio >= 0
+        && (!('codigo_barras' in data) || (data.codigo_barras is string && data.codigo_barras.size() <= 100))
+        && (!('costo' in data) || (data.costo is number && data.costo >= 0));
+    }
+
+    // Online Web Orders placed by customers
+    function isValidPedidoOnline(data) {
+      return data.clienteNombre is string 
+        && data.clienteNombre.size() > 0 
+        && data.clienteNombre.size() <= 150
+        && data.clienteTelefono is string 
+        && data.clienteTelefono.size() >= 5 
+        && data.clienteTelefono.size() <= 35
+        && data.total is number 
+        && data.total >= 0
+        && data.estado is string 
+        && data.estado in ['pendiente', 'confirmado', 'preparando', 'despachado', 'en_camino', 'entregado', 'cancelado'];
+    }
+
+    // Company Configuration and Exchange Rate (allows blank fiscal info on clean factory install)
+    function isValidEmpresaConfig(data) {
+      return data.nombreEmpresa is string 
+        && data.nombreEmpresa.size() <= 200
+        && data.tasaCambio is number 
+        && data.tasaCambio >= 0
+        && (!('rif' in data) || (data.rif is string && data.rif.size() <= 50))
+        && (!('direccionFiscal' in data) || (data.direccionFiscal is string && data.direccionFiscal.size() <= 300))
+        && (!('telefono' in data) || (data.telefono is string && data.telefono.size() <= 100))
+        && (!('factoryResetAt' in data) || (data.factoryResetAt is string && data.factoryResetAt.size() <= 64))
+        && (!('fiscalUpdatedAt' in data) || (data.fiscalUpdatedAt is string && data.fiscalUpdatedAt.size() <= 64));
+    }
+
+    function hasFiscalContent(data) {
+      return (data.nombreEmpresa is string && data.nombreEmpresa.size() > 0)
+        || ('rif' in data && data.rif is string && data.rif.size() > 0)
+        || ('direccionFiscal' in data && data.direccionFiscal is string && data.direccionFiscal.size() > 0)
+        || ('telefono' in data && data.telefono is string && data.telefono.size() > 0)
+        || ('logoUrl' in data && data.logoUrl is string && data.logoUrl.size() > 0)
+        || ('piePaginaTicket' in data && data.piePaginaTicket is string && data.piePaginaTicket.size() > 0);
+    }
+
+    function hasFiscalStamp(data) {
+      return 'fiscalUpdatedAt' in data && data.fiscalUpdatedAt is string && data.fiscalUpdatedAt.size() > 0;
+    }
+
+    function hasResetStamp(data) {
+      return 'factoryResetAt' in data && data.factoryResetAt is string && data.factoryResetAt.size() > 0;
+    }
+
+    function isIncomingFiscalAllowedAgainstReset(data) {
+      return !hasFiscalContent(data)
+        || !hasResetStamp(data)
+        || (hasFiscalStamp(data) && data.fiscalUpdatedAt > data.factoryResetAt);
+    }
+
+    function isEmpresaUpdateAllowed(newData, oldData) {
+      return isIncomingFiscalAllowedAgainstReset(newData)
+        && (
+          !hasFiscalContent(newData)
+          || !hasResetStamp(oldData)
+          || (hasFiscalStamp(newData) && newData.fiscalUpdatedAt > oldData.factoryResetAt)
+        )
+        && (
+          hasFiscalContent(newData)
+          || !hasFiscalContent(oldData)
+          || !hasFiscalStamp(oldData)
+          || (hasResetStamp(oldData) && oldData.fiscalUpdatedAt <= oldData.factoryResetAt)
+          || (hasResetStamp(newData) && newData.factoryResetAt >= oldData.fiscalUpdatedAt)
+        );
+    }
+
+    // Digital Store Settings
+    function isValidTiendaConfig(data) {
+      return (!('whatsappContacto' in data) || (data.whatsappContacto is string && data.whatsappContacto.size() <= 40))
+        && (!('costoDeliveryFijo' in data) || (data.costoDeliveryFijo is number && data.costoDeliveryFijo >= 0))
+        && (!('costoDeliveryBase' in data) || (data.costoDeliveryBase is number && data.costoDeliveryBase >= 0));
+    }
+
+    // POS Sales and Financial Invoices
+    function isValidVenta(data) {
+      return (!('numeroFactura' in data) || (data.numeroFactura is string && data.numeroFactura.size() <= 100))
+        && data.total is number 
+        && data.total >= 0
+        && data.fecha is string 
+        && data.fecha.size() > 0;
+    }
+
+    // Branch Inventory
+    function isValidInventario(data) {
+      return (!('items' in data) || data.items is list)
+        && (!('sucursalId' in data) || data.sucursalId is number);
+    }
+
+    // Branch Locations
+    function isValidSucursal(data) {
+      return data.nombre is string 
+        && data.nombre.size() > 0 
+        && data.nombre.size() <= 150
+        && (!('tipo' in data) || (data.tipo is string && data.tipo in ['tienda', 'oficina']));
+    }
+
+    // User Accounts
+    function isValidUsuario(data) {
+      return data.nombre_completo is string 
+        && data.nombre_completo.size() > 0 
+        && data.username is string 
+        && data.rol in ['admin', 'supervisor', 'cajero', 'inventario'];
+    }
+
+    // Suppliers
+    function isValidProveedor(data) {
+      return data.nombre is string 
+        && data.nombre.size() > 0 
+        && data.nombre.size() <= 200;
+    }
+
+    // Purchases from Suppliers
+    function isValidCompra(data) {
+      return (!('numeroFactura' in data) || (data.numeroFactura is string && data.numeroFactura.size() <= 100))
+        && data.total is number 
+        && data.total >= 0;
+    }
+
+    // Financial Balances (CxP and CxC)
+    function isValidCuentaFinanciera(data) {
+      return data.montoTotal is number 
+        && data.montoTotal >= 0
+        && (!('montoPagado' in data) || (data.montoPagado is number && data.montoPagado >= 0));
+    }
+
+    // Immutable Audit Logs
+    function isValidAuditoria(data) {
+      return (('accion' in data && data.accion is string && data.accion.size() <= 250) || 
+              ('tipo_accion' in data && data.tipo_accion is string && data.tipo_accion.size() <= 250))
+        && data.timestamp is string;
+    }
+
+    // -------------------------------------------------------------
+    // Collections Access Rules
+    // -------------------------------------------------------------
+
+    // Health check and connection validation document
+    match /test/{docId} {
+      allow get, write: if isValidId(docId);
+      allow list: if false;
+    }
+
+    // Products: Public read for digital catalog and POS; validated writes
+    match /productos/{productoId} {
+      allow read: if true;
+      allow create, update: if isValidId(productoId) && isValidProducto(incoming());
+      allow delete: if isValidId(productoId);
+    }
+
+    // Online Web Orders placed by customers
+    match /pedidos_online/{pedidoId} {
+      allow get: if isValidId(pedidoId);
+      allow list: if true;
+      allow create: if isValidId(pedidoId) && isValidPedidoOnline(incoming());
+      allow update: if isValidId(pedidoId) && isValidPedidoOnline(incoming());
+      allow delete: if isValidId(pedidoId);
+    }
+
+    // Enterprise Configuration and Daily BCV Exchange Rate
+    match /empresa_config/{configId} {
+      allow read: if true;
+      allow create: if isValidId(configId) && isValidEmpresaConfig(incoming()) && isIncomingFiscalAllowedAgainstReset(incoming());
+      allow update: if isValidId(configId) && isValidEmpresaConfig(incoming()) && isEmpresaUpdateAllowed(incoming(), existing());
+      allow delete: if isValidId(configId);
+    }
+
+    // Digital Store Configuration (WhatsApp, Delivery, Pago Móvil)
+    match /tienda_config/{configId} {
+      allow read: if true;
+      allow create, update: if isValidId(configId) && isValidTiendaConfig(incoming());
+      allow delete: if isValidId(configId);
+    }
+
+    // POS Sales and Invoices: Immutable updates, cleanup allowed on factory reset
+    match /ventas/{ventaId} {
+      allow get: if isValidId(ventaId);
+      allow list: if true;
+      allow create: if isValidId(ventaId) && isValidVenta(incoming());
+      allow update: if false;
+      allow delete: if isValidId(ventaId);
+    }
+
+    // Branch Inventory: Isolated stock tracking
+    match /inventario/{docId} {
+      allow get: if isValidId(docId);
+      allow list: if true;
+      allow create, update: if isValidId(docId) && isValidInventario(incoming());
+      allow delete: if isValidId(docId);
+    }
+
+    // Branch Locations
+    match /sucursales/{sucursalId} {
+      allow get: if isValidId(sucursalId);
+      allow list: if true;
+      allow create, update: if isValidId(sucursalId) && isValidSucursal(incoming());
+      allow delete: if isValidId(sucursalId);
+    }
+
+    // System Users and Operators
+    match /usuarios/{usuarioId} {
+      allow get: if isValidId(usuarioId);
+      allow list: if true;
+      allow create, update: if isValidId(usuarioId) && isValidUsuario(incoming());
+      allow delete: if isValidId(usuarioId);
+    }
+
+    // Suppliers Catalog
+    match /proveedores/{proveedorId} {
+      allow get: if isValidId(proveedorId);
+      allow list: if true;
+      allow create, update: if isValidId(proveedorId) && isValidProveedor(incoming());
+      allow delete: if isValidId(proveedorId);
+    }
+
+    // Purchase Invoices: Immutable updates, cleanup allowed on factory reset
+    match /compras/{compraId} {
+      allow get: if isValidId(compraId);
+      allow list: if true;
+      allow create: if isValidId(compraId) && isValidCompra(incoming());
+      allow update: if false;
+      allow delete: if isValidId(compraId);
+    }
+
+    // Accounts Payable (CxP)
+    match /cuentas_por_pagar/{cxpId} {
+      allow get: if isValidId(cxpId);
+      allow list: if true;
+      allow create, update: if isValidId(cxpId) && isValidCuentaFinanciera(incoming());
+      allow delete: if isValidId(cxpId);
+    }
+
+    // Accounts Receivable (CxC)
+    match /cuentas_por_cobrar/{cxcId} {
+      allow get: if isValidId(cxcId);
+      allow list: if true;
+      allow create, update: if isValidId(cxcId) && isValidCuentaFinanciera(incoming());
+      allow delete: if isValidId(cxcId);
+    }
+
+    // Audit Logs: Strictly append-only, absolutely immutable
+    match /auditoria/{logId} {
+      allow get: if isValidId(logId);
+      allow list: if true;
+      allow create: if isValidId(logId) && isValidAuditoria(incoming());
+      allow update, delete: if false; // Bitácora 100% inmutable
+    }
+
+    // DEFAULT-DENY SAFETY NET: Catch-all to deny any undocumented collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
