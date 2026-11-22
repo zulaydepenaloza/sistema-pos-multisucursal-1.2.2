@@ -225,22 +225,32 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
       return;
     }
 
-    // Optional admin check if user is admin
-    if (currentUser?.rol === 'admin' && confirmPin.trim().length > 0) {
-      const entered = confirmPin.trim();
-      let isPinOk = entered === '1111' || entered === '1234' || entered === '9999';
-      if (!isPinOk) {
-        const targetAdmin =
-          usuarios.find((u) => u.id === currentUser.id) ||
-          usuarios.find((u) => u.rol === 'admin');
-        if (targetAdmin) {
-          isPinOk = await verifyUserPin(entered, targetAdmin.pin, targetAdmin);
-        }
+    // Strict administrator PIN verification (no hardcoded backdoor PINs)
+    const entered = confirmPin.trim();
+    if (entered.length < 4) {
+      setRestoreErrorMsg('Debes ingresar el PIN de Administrador válido para autorizar la restauración.');
+      return;
+    }
+
+    const adminCandidates = usuarios.filter((u) => u.rol === 'admin');
+    const orderedCandidates = currentUser
+      ? [
+          ...adminCandidates.filter((u) => u.id === currentUser.id),
+          ...adminCandidates.filter((u) => u.id !== currentUser.id),
+        ]
+      : adminCandidates;
+
+    let isPinOk = false;
+    for (const candidate of orderedCandidates) {
+      if (await verifyUserPin(entered, candidate.pin, candidate)) {
+        isPinOk = true;
+        break;
       }
-      if (!isPinOk) {
-        setRestoreErrorMsg('El PIN ingresado no coincide con tu PIN de administrador.');
-        return;
-      }
+    }
+
+    if (!isPinOk) {
+      setRestoreErrorMsg('El PIN ingresado no corresponde a un Administrador autorizado.');
+      return;
     }
 
     setIsRestoring(true);
@@ -611,20 +621,21 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
                     </span>
                   </label>
 
-                  {/* Optional Admin PIN */}
-                  {currentUser?.rol === 'admin' && (
-                    <div className="flex items-center gap-2">
-                      <span className="text-slate-400 text-[11px] whitespace-nowrap">PIN Admin (Opcional):</span>
-                      <input
-                        type="password"
-                        maxLength={6}
-                        value={confirmPin}
-                        onChange={(e) => setConfirmPin(e.target.value)}
-                        placeholder="PIN actual"
-                        className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white font-mono w-24 text-center"
-                      />
-                    </div>
-                  )}
+                  {/* Required Admin PIN verification */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-slate-300 font-semibold text-[11px] whitespace-nowrap">PIN Admin *:</span>
+                    <input
+                      type="password"
+                      maxLength={8}
+                      value={confirmPin}
+                      onChange={(e) => {
+                        setConfirmPin(e.target.value);
+                        setRestoreErrorMsg(null);
+                      }}
+                      placeholder="PIN Admin"
+                      className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white font-mono w-28 text-center"
+                    />
+                  </div>
                 </div>
               </div>
             )}
@@ -637,10 +648,11 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
               disabled={
                 !parseResult?.isValid ||
                 !acknowledgedWarning ||
+                confirmPin.trim().length < 4 ||
                 isRestoring
               }
               className={`w-full py-3 font-bold rounded-xl text-xs flex items-center justify-center gap-2 transition-all ${
-                parseResult?.isValid && acknowledgedWarning && !isRestoring
+                parseResult?.isValid && acknowledgedWarning && confirmPin.trim().length >= 4 && !isRestoring
                   ? 'bg-purple-600 hover:bg-purple-500 text-white shadow-lg shadow-purple-950/60 cursor-pointer hover:scale-101'
                   : 'bg-slate-800 text-slate-500 cursor-not-allowed'
               }`}

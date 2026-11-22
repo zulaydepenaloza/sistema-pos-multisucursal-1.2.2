@@ -14,6 +14,7 @@ import {
   deleteDoc,
   limit,
   runTransaction,
+  deleteField,
 } from 'firebase/firestore';
 import firebaseConfigData from '../../firebase-applet-config.json';
 import {
@@ -261,6 +262,9 @@ export async function saveEmpresaConfigToFirestore(config: EmpresaConfig): Promi
     if (config.fiscalUpdatedAt !== undefined) {
       cleanConfig.fiscalUpdatedAt = config.fiscalUpdatedAt;
     }
+    if (typeof config.stockMinimoAlerta === 'number' && config.stockMinimoAlerta >= 0) {
+      cleanConfig.stockMinimoAlerta = config.stockMinimoAlerta;
+    }
     await setDoc(doc(db, 'empresa_config', 'main'), cleanConfig);
     return true;
   } catch (error) {
@@ -437,6 +441,11 @@ export async function saveProductToFirestore(prod: Producto): Promise<boolean> {
       imagen: prod.imagen || '',
       destacadoTienda: prod.destacadoTienda !== undefined ? Boolean(prod.destacadoTienda) : true,
     };
+    if (typeof prod.stock_minimo === 'number' && !Number.isNaN(prod.stock_minimo) && prod.stock_minimo >= 0) {
+      cleanProd.stock_minimo = prod.stock_minimo;
+    } else {
+      cleanProd.stock_minimo = deleteField();
+    }
     await setDoc(doc(db, 'productos', String(prod.id)), cleanProd, { merge: true });
     return true;
   } catch (err) {
@@ -595,6 +604,11 @@ export async function syncAllToFirestore({
           imagen: prod.imagen || '',
           destacadoTienda: prod.destacadoTienda !== undefined ? Boolean(prod.destacadoTienda) : true,
         };
+        if (typeof prod.stock_minimo === 'number' && !Number.isNaN(prod.stock_minimo) && prod.stock_minimo >= 0) {
+          cleanProd.stock_minimo = prod.stock_minimo;
+        } else {
+          cleanProd.stock_minimo = deleteField();
+        }
         batch.set(prodRef, cleanProd, { merge: true });
         count++;
       }

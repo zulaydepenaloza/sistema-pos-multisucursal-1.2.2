@@ -16,6 +16,7 @@ export interface Producto {
   descripcion?: string;
   imagen?: string;
   destacadoTienda?: boolean;
+  stock_minimo?: number;
 }
 
 export interface InventarioItem {
@@ -228,6 +229,7 @@ export interface EmpresaConfig {
   piePaginaTicket?: string;
   factoryResetAt?: string;
   fiscalUpdatedAt?: string;
+  stockMinimoAlerta?: number;
 }
 
 export interface RegistroAuditoria {

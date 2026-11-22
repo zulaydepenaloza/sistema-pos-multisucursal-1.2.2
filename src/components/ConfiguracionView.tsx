@@ -73,7 +73,7 @@ interface ConfiguracionViewProps {
   onUpdateSucursales?: (nextSucursales: Sucursal[], auditDescription?: string) => void;
   currentUser: Usuario | null;
   onOpenRateModal: () => void;
-  onResetAllData?: () => void;
+  onResetAllData?: (verifiedAdminPin?: string) => void;
   auditoriaLogs?: RegistroAuditoria[];
   onClearAuditoriaLogs?: () => void;
   productos?: Producto[];
@@ -329,7 +329,7 @@ export const ConfiguracionView: React.FC<ConfiguracionViewProps> = ({
   const [newNombre, setNewNombre] = useState<string>('');
   const [newCargo, setNewCargo] = useState<string>('');
   const [newUsername, setNewUsername] = useState<string>('');
-  const [newPin, setNewPin] = useState<string>('1234');
+  const [newPin, setNewPin] = useState<string>('');
   const [newRol, setNewRol] = useState<'cajero' | 'supervisor' | 'inventario' | 'admin'>('cajero');
   const [newSucursalId, setNewSucursalId] = useState<number | null>(1);
   const [newUserError, setNewUserError] = useState<string | null>(null);
@@ -567,7 +567,7 @@ export const ConfiguracionView: React.FC<ConfiguracionViewProps> = ({
     setNewNombre('');
     setNewCargo('');
     setNewUsername('');
-    setNewPin('1234');
+    setNewPin('');
     setNewRol('cajero');
     setNewSucursalId(1);
     applyPresetPermissions('pos', true);
@@ -1693,7 +1693,7 @@ export const ConfiguracionView: React.FC<ConfiguracionViewProps> = ({
                     type="text"
                     required
                     maxLength={8}
-                    placeholder="1234"
+                    placeholder="Mínimo 4 dígitos"
                     value={newPin}
                     onChange={(e) => setNewPin(e.target.value)}
                     className="w-full bg-slate-950 border border-amber-500/50 text-amber-300 font-mono text-sm font-bold px-3 py-2 rounded-xl focus:border-amber-400 focus:outline-none tracking-widest text-center"
@@ -2676,7 +2676,7 @@ export const ConfiguracionView: React.FC<ConfiguracionViewProps> = ({
                     setResetPinInput(e.target.value);
                     setResetError(null);
                   }}
-                  placeholder="PIN de 4 dígitos (Ej: 1111)"
+                  placeholder="PIN de Administrador"
                   className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white font-mono text-center tracking-widest focus:border-rose-500 focus:outline-none"
                 />
               </div>
@@ -2702,34 +2702,28 @@ export const ConfiguracionView: React.FC<ConfiguracionViewProps> = ({
                   const isWordValid = resetWordInput.trim().toUpperCase() === 'REINICIAR';
                   const adminUsers = usuarios.filter((u) => u.rol === 'admin');
                   const pinToCheck = resetPinInput.trim();
-                  let isAdminPinValid =
-                    pinToCheck === '1111' ||
-                    pinToCheck === '1234' ||
-                    pinToCheck === '9999' ||
-                    pinToCheck === '1001';
-
-                  if (!isAdminPinValid) {
-                    for (const u of adminUsers) {
-                      if (await verifyUserPin(pinToCheck, u.pin, u)) {
-                        isAdminPinValid = true;
-                        break;
-                      }
-                    }
-                  }
 
                   if (!isWordValid) {
                     setResetError('Debes escribir la palabra REINICIAR exactamente.');
                     return;
                   }
 
+                  let isAdminPinValid = false;
+                  for (const u of adminUsers) {
+                    if (await verifyUserPin(pinToCheck, u.pin, u)) {
+                      isAdminPinValid = true;
+                      break;
+                    }
+                  }
+
                   if (!isAdminPinValid) {
-                    setResetError('El PIN ingresado no corresponde a un Administrador.');
+                    setResetError('El PIN ingresado no corresponde a un Administrador autorizado.');
                     return;
                   }
 
                   setShowResetModal(false);
                   if (onResetAllData) {
-                    onResetAllData();
+                    onResetAllData(pinToCheck);
                   }
                   setSuccessMsg('¡Base de datos y sistema reiniciados con éxito a valores de fábrica!');
                   setTimeout(() => setSuccessMsg(null), 6000);

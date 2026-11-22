@@ -119,42 +119,24 @@ export async function hashPin(pin: string): Promise<string> {
 export async function verifyUserPin(
   enteredPin: string,
   storedPinOrHash: string,
-  userOrRole?: Usuario | string
+  _userOrRole?: Usuario | string
 ): Promise<boolean> {
-  if (!enteredPin) return false;
+  if (!enteredPin || !storedPinOrHash) return false;
   const cleanEntered = enteredPin.trim();
+  const cleanStored = storedPinOrHash.trim();
 
-  // 1. Direct match (plain text)
-  if (storedPinOrHash && cleanEntered === storedPinOrHash.trim()) {
+  if (!cleanEntered || !cleanStored || cleanStored === '••••') {
+    return false;
+  }
+
+  // 1. Direct match (legacy plain text before storage migration)
+  if (!isHashedPin(cleanStored) && cleanEntered === cleanStored) {
     return true;
   }
 
   // 2. Hash match (SHA-256)
-  if (storedPinOrHash) {
-    const computedHash = await hashPin(cleanEntered);
-    if (computedHash.toLowerCase() === storedPinOrHash.trim().toLowerCase()) {
-      return true;
-    }
-  }
-
-  // 3. Fallback for Gerente General / Admin:
-  // If the target user is the administrator / gerente general,
-  // accept PIN 9999 and 1111 to guarantee access
-  const isAdmin =
-    userOrRole === 'admin' ||
-    (typeof userOrRole === 'object' &&
-      userOrRole !== null &&
-      (userOrRole.rol === 'admin' ||
-        userOrRole.username === 'admin' ||
-        userOrRole.username === 'admin_general' ||
-        userOrRole.username === 'gerente_general' ||
-        userOrRole.cargo?.toLowerCase().includes('gerente')));
-
-  if (isAdmin && (cleanEntered === '9999' || cleanEntered === '1111')) {
-    return true;
-  }
-
-  return false;
+  const computedHash = await hashPin(cleanEntered);
+  return computedHash.toLowerCase() === cleanStored.toLowerCase();
 }
 
 /**

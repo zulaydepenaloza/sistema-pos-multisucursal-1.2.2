@@ -7,5 +7,6 @@ coverage/
 .env*
 !.env.example
 data/server_db.json
+data/.session_secret
 *.zip
 *.bak

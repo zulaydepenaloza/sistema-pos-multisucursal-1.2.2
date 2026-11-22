@@ -48,6 +48,7 @@ import {
 } from '../types';
 import { formatUSD, formatBs } from '../lib/currency';
 import { verifyUserPin } from '../lib/security';
+import { INITIAL_USUARIOS } from '../data/mockData';
 import { AITechFooter } from './AITechFooter';
 import { TiendaLegalModal, LegalTab } from './TiendaLegalModal';
 
@@ -179,28 +180,37 @@ export const TiendaOnlineView: React.FC<TiendaOnlineViewProps> = ({
   const [showPinPassword, setShowPinPassword] = useState<boolean>(false);
   const [pinError, setPinError] = useState<string | null>(null);
 
+  const [exitPinFailures, setExitPinFailures] = useState<number>(0);
+  const [exitPinLockUntil, setExitPinLockUntil] = useState<number>(0);
+
   const handleVerifyPinAndExit = async (e: React.FormEvent) => {
     e.preventDefault();
     setPinError(null);
+
+    if (exitPinLockUntil > Date.now()) {
+      const secs = Math.ceil((exitPinLockUntil - Date.now()) / 1000);
+      setPinError(`Demasiados intentos fallidos. Espera ${secs}s para volver a intentar.`);
+      return;
+    }
+
     const pin = inputAdminPin.trim();
     if (!pin) {
       setPinError('Por favor ingrese el PIN de seguridad.');
       return;
     }
 
+    const rosterToVerify = usuarios && usuarios.length > 0 ? usuarios : INITIAL_USUARIOS;
     let isValid = false;
-    if (usuarios && usuarios.length > 0) {
-      for (const u of usuarios) {
-        if (await verifyUserPin(pin, u.pin, u)) {
-          isValid = true;
-          break;
-        }
+    for (const u of rosterToVerify) {
+      if (await verifyUserPin(pin, u.pin, u)) {
+        isValid = true;
+        break;
       }
-    } else {
-      isValid = pin === '9999' || pin === '1001' || pin === '1002' || pin === '1003' || pin === '1004' || pin === '3001';
     }
 
     if (isValid) {
+      setExitPinFailures(0);
+      setExitPinLockUntil(0);
       setShowPinModal(false);
       setInputAdminPin('');
       setPinError(null);
@@ -213,7 +223,14 @@ export const TiendaOnlineView: React.FC<TiendaOnlineViewProps> = ({
       }
       onVolverAlPos();
     } else {
-      setPinError('PIN no autorizado. Si es cliente, continúe navegando por la tienda.');
+      const nextFails = exitPinFailures + 1;
+      setExitPinFailures(nextFails);
+      if (nextFails >= 5) {
+        setExitPinLockUntil(Date.now() + 30 * 1000);
+        setPinError('Demasiados intentos incorrectos. Espera 30 segundos antes de reintentar.');
+      } else {
+        setPinError('PIN no autorizado. Si es cliente, continúe navegando por la tienda.');
+      }
     }
   };
 

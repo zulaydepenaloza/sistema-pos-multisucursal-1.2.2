@@ -11,6 +11,7 @@ export const DEFAULT_EMPRESA_CONFIG: EmpresaConfig = {
   nombreTienda1: 'Tienda A - Sector A',
   nombreTienda2: 'Tienda A - Sector B',
   nombreOficina: 'Oficina Central & Almacén',
+  stockMinimoAlerta: 20,
 };
 
 export const CLEAN_EMPRESA_CONFIG: EmpresaConfig = {
@@ -25,6 +26,7 @@ export const CLEAN_EMPRESA_CONFIG: EmpresaConfig = {
   nombreTienda2: 'Tienda 2',
   nombreOficina: 'Oficina Central / Almacén',
   piePaginaTicket: '',
+  stockMinimoAlerta: 20,
 };
 
 const STORAGE_KEY_EMPRESA = 'pos_empresa_config_v1';

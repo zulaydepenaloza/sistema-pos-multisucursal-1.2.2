@@ -353,20 +353,20 @@ export function validateActivationKey(
     }
   }
 
-  // 2. LEGACY HMAC-SHA256 FORMAT (Prefix 'LIC-') - Provided for seamless migration
-  if (cleanKey.startsWith('LIC-') && cleanKey.includes('.')) {
+  // 2. OFFLINE EVALUATION DEMO TOKEN FORMAT (Prefix 'DEMO-') - Strictly 15-day demo, max 2 registers/branches
+  if (cleanKey.startsWith('DEMO-') && cleanKey.includes('.')) {
     try {
-      const rawBody = cleanKey.substring(4);
-      const [base64Payload, providedSignature] = rawBody.split('.');
+      const rawBody = cleanKey.substring(5);
+      const [base64Payload, providedChecksum] = rawBody.split('.');
 
-      if (!base64Payload || !providedSignature) {
+      if (!base64Payload || !providedChecksum) {
         return {
           isValid: false,
           isExpired: false,
           isMachineMismatch: false,
           isTampered: true,
           status: 'invalid_signature',
-          message: 'Estructura de licencia criptográfica legacy incompleta.',
+          message: 'Estructura de licencia de evaluación incompleta.',
         };
       }
 
@@ -374,32 +374,52 @@ export function validateActivationKey(
       const jsonStr = decodeURIComponent(escape(atob(standardB64)));
       const payload: LicensePayload = JSON.parse(jsonStr);
 
-      if (!payload.machineId || !payload.empresa || !payload.fechaVencimiento) {
+      if (
+        !payload.machineId ||
+        !payload.empresa ||
+        !payload.fechaEmision ||
+        !payload.fechaVencimiento ||
+        payload.tipo !== 'demo'
+      ) {
         return {
           isValid: false,
           isExpired: false,
           isMachineMismatch: false,
           isTampered: true,
           status: 'invalid_signature',
-          message: 'Los datos de la licencia legacy están corruptos.',
+          message: 'Licencia de evaluación inválida o alterada.',
         };
       }
 
-      // Legacy verification check
-      const legacySecret = 'POS_CRYPT_SEC_KEY_VAL_2026_MULTI_BRANCH_LATAM_G82X';
-      const expectedSignatureRaw = sha256(
-        `${base64Payload}::${legacySecret}::${payload.machineId.trim().toUpperCase()}`
-      );
-      const expectedSignatureShort = expectedSignatureRaw.substring(0, 16).toUpperCase();
-
-      if (providedSignature.toUpperCase() !== expectedSignatureShort) {
+      // Enforce max 16-day span on local evaluation tokens
+      const issued = new Date(payload.fechaEmision);
+      const expires = new Date(payload.fechaVencimiento);
+      const spanDays = Math.ceil((expires.getTime() - issued.getTime()) / 86400000);
+      if (!Number.isFinite(spanDays) || spanDays < 0 || spanDays > 16) {
         return {
           isValid: false,
           isExpired: false,
           isMachineMismatch: false,
           isTampered: true,
           status: 'invalid_signature',
-          message: 'Firma de licencia legacy no coincide.',
+          message: 'La licencia de evaluación excede el período permitido.',
+        };
+      }
+
+      const expectedChecksum = sha256(
+        `DEMO_EVAL_V2::${base64Payload}::${payload.machineId.trim().toUpperCase()}`
+      )
+        .substring(0, 16)
+        .toUpperCase();
+
+      if (providedChecksum.toUpperCase() !== expectedChecksum) {
+        return {
+          isValid: false,
+          isExpired: false,
+          isMachineMismatch: false,
+          isTampered: true,
+          status: 'invalid_signature',
+          message: 'Código de verificación de licencia demo inválido.',
         };
       }
 
@@ -410,21 +430,21 @@ export function validateActivationKey(
           isMachineMismatch: true,
           isTampered: false,
           status: 'machine_mismatch',
-          message: `Licencia vinculada a [${payload.machineId}]. Este equipo es [${currentMachineId}].`,
+          message: `Licencia de prueba vinculada a [${payload.machineId}]. Este equipo es [${currentMachineId}].`,
           license: payload,
           algorithm: 'Legacy HMAC-SHA256',
         };
       }
 
       return checkExpiration(payload, 'Legacy HMAC-SHA256');
-    } catch (err) {
+    } catch {
       return {
         isValid: false,
         isExpired: false,
         isMachineMismatch: false,
         isTampered: true,
         status: 'invalid_signature',
-        message: 'Error al verificar licencia legacy.',
+        message: 'Error al verificar licencia de evaluación.',
       };
     }
   }
@@ -435,7 +455,7 @@ export function validateActivationKey(
     isMachineMismatch: false,
     isTampered: true,
     status: 'invalid_signature',
-    message: 'Formato de clave de licencia inválido. Las claves deben comenzar con ED2- o LIC-.',
+    message: 'Formato de clave de licencia inválido. Las claves comerciales oficiales deben comenzar con ED2-.',
   };
 }
 
@@ -538,12 +558,11 @@ export async function requestTrialLicenseFromServer(
   }
 }
 
-// Compatibility wrapper for initial evaluation provisioning
+// Offline 15-day Demo Evaluation License provisioning (no commercial/master secrets in frontend)
 export function createTrialLicenseForCurrentMachine(
   empresa: string = 'Cliente de Prueba',
   rif: string = 'V-00000000'
 ): string {
-  // If invoked synchronously in offline fallback mode, return a legacy demo token that can be verified
   const machineId = getMachineFingerprint();
   const now = new Date();
   const exp = new Date();
@@ -567,28 +586,19 @@ export function createTrialLicenseForCurrentMachine(
     .replace(/\//g, '_')
     .replace(/=+$/, '');
 
-  const legacySecret = 'POS_CRYPT_SEC_KEY_VAL_2026_MULTI_BRANCH_LATAM_G82X';
-  const sig = sha256(`${base64Payload}::${legacySecret}::${machineId}`).substring(0, 16).toUpperCase();
-  return `LIC-${base64Payload}.${sig}`;
+  const sig = sha256(`DEMO_EVAL_V2::${base64Payload}::${machineId}`).substring(0, 16).toUpperCase();
+  return `DEMO-${base64Payload}.${sig}`;
 }
 
-// Offline Developer Authorized License Generator (Strictly validates developer secret)
+// Commercial license generation MUST happen exclusively on the authenticated backend (Ed25519).
+// Never embed developer master secrets or signing keys in the frontend bundle.
 export function generateOfflineAuthorizedLicense(
-  payload: LicensePayload,
-  devSecret: string
+  _payload: LicensePayload,
+  _devSecret: string
 ): { success: boolean; key?: string; error?: string } {
-  const cleanToken = devSecret ? devSecret.trim() : '';
-  if (cleanToken !== 'OmniPosDev2026MasterKey' && cleanToken !== 'ADMIN_DEV_KEY') {
-    return { success: false, error: 'Clave o token de desarrollador incorrecto.' };
-  }
-
-  const jsonStr = JSON.stringify(payload);
-  const base64Payload = btoa(unescape(encodeURIComponent(jsonStr)))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-
-  const legacySecret = 'POS_CRYPT_SEC_KEY_VAL_2026_MULTI_BRANCH_LATAM_G82X';
-  const sig = sha256(`${base64Payload}::${legacySecret}::${payload.machineId.trim().toUpperCase()}`).substring(0, 16).toUpperCase();
-  return { success: true, key: `LIC-${base64Payload}.${sig}` };
+  return {
+    success: false,
+    error:
+      'La emisión de licencias comerciales requiere verificación y firma digital Ed25519 en el servidor autorizado.',
+  };
 }

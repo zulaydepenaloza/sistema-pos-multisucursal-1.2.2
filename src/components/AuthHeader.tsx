@@ -78,6 +78,9 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
   });
   const [enteredPin, setEnteredPin] = useState<string>('');
   const [errorPin, setErrorPin] = useState<string | null>(null);
+  const [failedAttempts, setFailedAttempts] = useState<number>(0);
+  const [lockoutUntilMs, setLockoutUntilMs] = useState<number>(0);
+  const [lockoutRemainingSec, setLockoutRemainingSec] = useState<number>(0);
 
   const userListRef = useRef<HTMLDivElement>(null);
   const userOptionRefs = useRef<Record<number, HTMLButtonElement | null>>({});
@@ -121,6 +124,27 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
     if (!showLoginModal) return;
     userOptionRefs.current[selectedUserId]?.scrollIntoView({ block: 'nearest' });
   }, [selectedUserId, showLoginModal]);
+
+  // Countdown timer when temporarily locked out after failed PIN attempts
+  useEffect(() => {
+    if (lockoutUntilMs <= Date.now()) {
+      setLockoutRemainingSec(0);
+      return;
+    }
+    const updateCountdown = () => {
+      const rem = Math.ceil((lockoutUntilMs - Date.now()) / 1000);
+      if (rem <= 0) {
+        setLockoutRemainingSec(0);
+        setLockoutUntilMs(0);
+        setFailedAttempts(0);
+      } else {
+        setLockoutRemainingSec(rem);
+      }
+    };
+    updateCountdown();
+    const timer = setInterval(updateCountdown, 500);
+    return () => clearInterval(timer);
+  }, [lockoutUntilMs]);
 
   const handleOpenLoginModal = () => {
     setErrorPin(null);
@@ -172,6 +196,13 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
   const handleVerifyLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorPin(null);
+
+    if (lockoutUntilMs > Date.now()) {
+      const rem = Math.ceil((lockoutUntilMs - Date.now()) / 1000);
+      setErrorPin(`Demasiados intentos fallidos. Por seguridad, espera ${rem}s antes de intentar nuevamente.`);
+      return;
+    }
+
     const targetUser = availableUsers.find((u) => u.id === selectedUserId) || availableUsers[0];
     if (!targetUser) {
       setErrorPin('Por favor selecciona un usuario válido.');
@@ -180,10 +211,9 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
 
     const isValid = await verifyUserPin(enteredPin, targetUser.pin, targetUser);
     if (isValid) {
-      onSelectUser({
-        ...targetUser,
-        pin: enteredPin.trim(),
-      });
+      setFailedAttempts(0);
+      setLockoutUntilMs(0);
+      onSelectUser(targetUser);
       if (onLoginAudit) {
         onLoginAudit(true, targetUser, 'Inicio de Sesión');
       }
@@ -191,10 +221,19 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
       setEnteredPin('');
       setErrorPin(null);
     } else {
+      const nextAttempts = failedAttempts + 1;
+      setFailedAttempts(nextAttempts);
       if (onLoginAudit) {
         onLoginAudit(false, targetUser, 'Inicio de Sesión');
       }
-      setErrorPin('PIN incorrecto. Por favor verifica e intenta nuevamente.');
+      if (nextAttempts >= 5) {
+        const until = Date.now() + 30 * 1000;
+        setLockoutUntilMs(until);
+        setLockoutRemainingSec(30);
+        setErrorPin('Demasiados intentos fallidos (5). Acceso bloqueado temporalmente por 30 segundos.');
+      } else {
+        setErrorPin(`PIN incorrecto (${nextAttempts}/5 intentos). Verifica e intenta nuevamente.`);
+      }
     }
   };
 
@@ -420,10 +459,15 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
                 </button>
                 <button
                   type="submit"
-                  className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-5 py-2.5 rounded-xl text-xs transition-colors cursor-pointer flex items-center gap-1.5"
+                  disabled={lockoutRemainingSec > 0}
+                  className={`font-bold px-5 py-2.5 rounded-xl text-xs transition-colors flex items-center gap-1.5 ${
+                    lockoutRemainingSec > 0
+                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      : 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 cursor-pointer'
+                  }`}
                 >
                   <UserCheck className="w-4 h-4" />
-                  <span>Ingresar</span>
+                  <span>{lockoutRemainingSec > 0 ? `Bloqueado (${lockoutRemainingSec}s)` : 'Ingresar'}</span>
                 </button>
               </div>
             </form>

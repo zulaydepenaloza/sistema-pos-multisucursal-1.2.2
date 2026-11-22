@@ -173,26 +173,36 @@ export const LicenseManagerView: React.FC<LicenseManagerViewProps> = ({
       });
 
       const contentType = resp.headers.get('content-type') || '';
-      if (resp.ok && contentType.includes('application/json')) {
-        const data = await resp.json();
-        if (data.success && data.key) {
-          setGeneratedKeyResult(data.key);
-          setActionError(null);
-          return;
-        }
+      const data = contentType.includes('application/json') ? await resp.json().catch(() => null) : null;
+
+      if (resp.ok && data?.success && data?.key) {
+        setGeneratedKeyResult(data.key);
+        setActionError(null);
+        return;
       }
-    } catch (e: any) {
-      console.warn('Backend API no disponible para emitir licencia, usando generador seguro autorizado:', e);
+
+      if (!resp.ok) {
+        setActionError(
+          data?.error ||
+            (resp.status === 401 || resp.status === 403
+              ? 'Acceso denegado: Credencial de desarrollador incorrecta.'
+              : `No se pudo emitir la licencia (HTTP ${resp.status}).`)
+        );
+        return;
+      }
+    } catch {
+      // Network offline only — never allow client-side commercial issuance
     }
 
-    // Fallback seguro: Si el servidor no respondió con JSON (ej: modo offline, archivo HTML local o proxy de cookies),
-    // comprobamos el token maestro de desarrollador directamente para generar la clave autorizada
     const offlineRes = generateOfflineAuthorizedLicense(payload, devPin);
     if (offlineRes.success && offlineRes.key) {
       setGeneratedKeyResult(offlineRes.key);
       setActionError(null);
     } else {
-      setActionError(offlineRes.error || 'Token de autorización de desarrollador incorrecto.');
+      setActionError(
+        offlineRes.error ||
+          'No se pudo contactar el servidor de licencias. Se requiere conexión con el backend autorizado.'
+      );
     }
   };
 

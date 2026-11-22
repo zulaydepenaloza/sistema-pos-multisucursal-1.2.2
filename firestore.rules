@@ -29,7 +29,8 @@ service cloud.firestore {
         && data.precio is number 
         && data.precio >= 0
         && (!('codigo_barras' in data) || (data.codigo_barras is string && data.codigo_barras.size() <= 100))
-        && (!('costo' in data) || (data.costo is number && data.costo >= 0));
+        && (!('costo' in data) || (data.costo is number && data.costo >= 0))
+        && (!('stock_minimo' in data) || (data.stock_minimo is number && data.stock_minimo >= 0 && data.stock_minimo <= 1000000));
     }
 
     // Online Web Orders placed by customers
@@ -56,7 +57,8 @@ service cloud.firestore {
         && (!('direccionFiscal' in data) || (data.direccionFiscal is string && data.direccionFiscal.size() <= 300))
         && (!('telefono' in data) || (data.telefono is string && data.telefono.size() <= 100))
         && (!('factoryResetAt' in data) || (data.factoryResetAt is string && data.factoryResetAt.size() <= 64))
-        && (!('fiscalUpdatedAt' in data) || (data.fiscalUpdatedAt is string && data.fiscalUpdatedAt.size() <= 64));
+        && (!('fiscalUpdatedAt' in data) || (data.fiscalUpdatedAt is string && data.fiscalUpdatedAt.size() <= 64))
+        && (!('stockMinimoAlerta' in data) || (data.stockMinimoAlerta is number && data.stockMinimoAlerta >= 0 && data.stockMinimoAlerta <= 1000000));
     }
 
     function hasFiscalContent(data) {

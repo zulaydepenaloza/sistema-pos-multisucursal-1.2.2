@@ -49,7 +49,8 @@
         "tasaCambio": { "type": "number", "description": "Tasa oficial USD a Bolívares" },
         "fechaTasa": { "type": "string", "description": "Fecha de última actualización de tasa" },
         "factoryResetAt": { "type": "string", "description": "Marca de tiempo ISO del último reinicio de fábrica" },
-        "fiscalUpdatedAt": { "type": "string", "description": "Marca de tiempo ISO de la última actualización manual de datos fiscales" }
+        "fiscalUpdatedAt": { "type": "string", "description": "Marca de tiempo ISO de la última actualización manual de datos fiscales" },
+        "stockMinimoAlerta": { "type": "number", "description": "Umbral global de stock mínimo para alertas visuales en tiendas" }
       },
       "required": ["tasaCambio"]
     },

@@ -75,12 +75,25 @@ import {
   saveSucursalesToFirestore,
   subscribeToSucursales,
   resetSystemDataInFirestore,
+  syncAllToFirestore,
 } from './lib/firebaseClient';
+import {
+  enqueueSyncOp,
+  flushSyncQueue,
+  clearPendingSyncOps,
+  PendingSyncOp,
+} from './lib/syncQueue';
+import {
+  ensurePosSessionToken,
+  clearPosSessionToken,
+  buildPosAuthHeaders,
+} from './lib/posSession';
 import {
   sanitizeUserForSession,
   sanitizeUsersForStorage,
   ensureMinimumFullAdmin,
   isFullPrivilegeAdmin,
+  isHashedPin,
   FULL_ADMIN_PERMISSIONS,
 } from './lib/security';
 import { findMatchingProveedor, deduplicateProveedoresList, normalizeSupplierRifKey } from './lib/validations';
@@ -641,9 +654,15 @@ export default function App() {
       const updatedActive = sanitized.find((u) => u.id === prev.id);
       return updatedActive ? sanitizeUserForSession(updatedActive) : prev;
     });
-    saveUsuariosToFirestore(sanitized).catch((err) =>
-      console.warn('Notice syncing usuarios to Firestore:', err)
-    );
+    saveUsuariosToFirestore(sanitized)
+      .then((ok) => {
+        if (!ok) {
+          enqueueSyncOp('firestore_usuarios', 'firestore_usuarios:all', sanitized);
+        }
+      })
+      .catch(() => {
+        enqueueSyncOp('firestore_usuarios', 'firestore_usuarios:all', sanitized);
+      });
     return sanitized;
   };
 
@@ -712,23 +731,34 @@ export default function App() {
     fetchServerOrders();
 
     if (!isClientStoreMode) {
-      // Broadcast current settings & catalog from POS to server (respecting factory reset epoch)
+      // Obtain signed POS session token and broadcast current settings & catalog from POS to server
       try {
         const clientResetStamp = localStorage.getItem(STORAGE_KEY_FACTORY_RESET_AT) || null;
-        fetch('/api/sync/state', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            empresaConfig,
-            tiendaConfig,
-            sucursales,
-            productos,
-            inventario,
-            pedidos: pedidosOnline,
-            replacePedidos: true,
-            clientFactoryResetAt: clientResetStamp,
-          }),
-        })
+        const adminPinHashes =
+          currentUser?.rol === 'admin'
+            ? usuarios
+                .filter((u) => u.rol === 'admin' && isHashedPin(u.pin))
+                .map((u) => ({ id: u.id, pinHash: u.pin }))
+            : undefined;
+        const syncPayload = {
+          empresaConfig,
+          tiendaConfig,
+          sucursales,
+          productos,
+          inventario,
+          pedidos: pedidosOnline,
+          replacePedidos: true,
+          clientFactoryResetAt: clientResetStamp,
+          ...(adminPinHashes && adminPinHashes.length > 0 ? { adminPinHashes } : {}),
+        };
+        ensurePosSessionToken(currentUser)
+          .then(() =>
+            fetch('/api/sync/state', {
+              method: 'POST',
+              headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
+              body: JSON.stringify(syncPayload),
+            })
+          )
           .then((res) => (res.ok ? res.json() : null))
           .then((data) => {
             if (!data || !isMounted) return;
@@ -741,7 +771,9 @@ export default function App() {
               if (Array.isArray(data.sucursales) && data.sucursales.length > 0) setSucursales(data.sucursales);
             }
           })
-          .catch(() => {});
+          .catch(() => {
+            enqueueSyncOp('sync_state', 'sync_state:latest', syncPayload);
+          });
       } catch (e) {}
     } else {
       // Pull latest synced catalog & company/store configuration for client link
@@ -786,23 +818,40 @@ export default function App() {
 
   // Keep server sync state fresh whenever POS catalog or configs change
   useEffect(() => {
-    if (isClientStoreMode) return;
+    if (isClientStoreMode || !currentUser) return;
     const timer = setTimeout(() => {
       try {
         const clientResetStamp = localStorage.getItem(STORAGE_KEY_FACTORY_RESET_AT) || null;
-        fetch('/api/sync/state', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            empresaConfig,
-            tiendaConfig,
-            sucursales,
-            productos,
-            inventario,
-            clientFactoryResetAt: clientResetStamp,
-          }),
-        })
-          .then((res) => (res.ok ? res.json() : null))
+        const adminPinHashes =
+          currentUser?.rol === 'admin'
+            ? usuarios
+                .filter((u) => u.rol === 'admin' && isHashedPin(u.pin))
+                .map((u) => ({ id: u.id, pinHash: u.pin }))
+            : undefined;
+        const syncPayload = {
+          empresaConfig,
+          tiendaConfig,
+          sucursales,
+          productos,
+          inventario,
+          clientFactoryResetAt: clientResetStamp,
+          ...(adminPinHashes && adminPinHashes.length > 0 ? { adminPinHashes } : {}),
+        };
+        ensurePosSessionToken(currentUser)
+          .then(() =>
+            fetch('/api/sync/state', {
+              method: 'POST',
+              headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
+              body: JSON.stringify(syncPayload),
+            })
+          )
+          .then((res) => {
+            if (!res.ok) {
+              enqueueSyncOp('sync_state', 'sync_state:latest', syncPayload);
+              return null;
+            }
+            return res.json();
+          })
           .then((data) => {
             if (!data || !data.resetRequired || !data.factoryResetAt) return;
             const currentReset = getStoredFactoryResetMs();
@@ -816,11 +865,85 @@ export default function App() {
               if (Array.isArray(data.sucursales) && data.sucursales.length > 0) setSucursales(data.sucursales);
             }
           })
-          .catch(() => {});
+          .catch(() => {
+            enqueueSyncOp('sync_state', 'sync_state:latest', syncPayload);
+          });
       } catch (e) {}
     }, 800);
     return () => clearTimeout(timer);
-  }, [isClientStoreMode, empresaConfig, tiendaConfig, sucursales, productos, inventario]);
+  }, [isClientStoreMode, currentUser, empresaConfig, tiendaConfig, sucursales, productos, inventario, usuarios]);
+
+  // Keep backend POS session synchronized with active user and flush offline queue on reconnect
+  useEffect(() => {
+    if (isClientStoreMode) return;
+    if (!currentUser) {
+      clearPosSessionToken();
+      return;
+    }
+
+    let active = true;
+    const runQueueFlush = async () => {
+      if (!active || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
+      await flushSyncQueue(async (op: PendingSyncOp) => {
+        switch (op.type) {
+          case 'sync_state': {
+            await ensurePosSessionToken(currentUser);
+            const r = await fetch('/api/sync/state', {
+              method: 'POST',
+              headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
+              body: JSON.stringify(op.payload),
+            });
+            return r.ok;
+          }
+          case 'pedido_create': {
+            const r = await fetch('/api/pedidos', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(op.payload),
+            });
+            return r.ok || r.status === 400;
+          }
+          case 'pedido_patch': {
+            await ensurePosSessionToken(currentUser);
+            const r = await fetch(`/api/pedidos/${encodeURIComponent(op.payload.id)}`, {
+              method: 'PATCH',
+              headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
+              body: JSON.stringify(op.payload.body),
+            });
+            return r.ok || r.status === 404;
+          }
+          case 'firestore_empresa':
+            return await saveEmpresaConfigToFirestore(op.payload);
+          case 'firestore_tienda':
+            return await saveTiendaConfigToFirestore(op.payload);
+          case 'firestore_product':
+            return await saveProductToFirestore(op.payload);
+          case 'firestore_delete_product':
+            return await deleteProductFromFirestore(op.payload.id);
+          case 'firestore_inventario':
+            return await saveInventarioToFirestore(op.payload);
+          case 'firestore_sucursales':
+            return await saveSucursalesToFirestore(op.payload);
+          case 'firestore_usuarios':
+            return await saveUsuariosToFirestore(op.payload);
+          default:
+            return true;
+        }
+      });
+    };
+
+    void ensurePosSessionToken(currentUser, { forceRefresh: true }).then(() => {
+      void runQueueFlush();
+    });
+
+    window.addEventListener('online', runQueueFlush);
+    const interval = setInterval(runQueueFlush, 15000);
+    return () => {
+      active = false;
+      window.removeEventListener('online', runQueueFlush);
+      clearInterval(interval);
+    };
+  }, [isClientStoreMode, currentUser]);
 
   // Sync URL parameter with client store view mode
   useEffect(() => {
@@ -993,6 +1116,13 @@ export default function App() {
           ? cloudEmpresa.tasaCambio
           : prev.tasaCambio;
 
+      const nextStockMinimoAlerta =
+        typeof cloudEmpresa.stockMinimoAlerta === 'number' &&
+        !Number.isNaN(cloudEmpresa.stockMinimoAlerta) &&
+        cloudEmpresa.stockMinimoAlerta >= 0
+          ? cloudEmpresa.stockMinimoAlerta
+          : prev.stockMinimoAlerta ?? 20;
+
       const updated: EmpresaConfig = {
         ...prev,
         ...cloudEmpresa,
@@ -1008,6 +1138,7 @@ export default function App() {
         fiscalUpdatedAt: nextFiscalUpdatedAt,
         factoryResetAt: nextFactoryResetAt,
         tasaCambio: nextTasa,
+        stockMinimoAlerta: nextStockMinimoAlerta,
         fechaTasa: cloudEmpresa.fechaTasa || prev.fechaTasa,
         ultimaActualizacionTasa: cloudEmpresa.ultimaActualizacionTasa || prev.ultimaActualizacionTasa,
       };
@@ -1027,6 +1158,7 @@ export default function App() {
         prev.fiscalUpdatedAt === updated.fiscalUpdatedAt &&
         prev.factoryResetAt === updated.factoryResetAt &&
         prev.tasaCambio === updated.tasaCambio &&
+        prev.stockMinimoAlerta === updated.stockMinimoAlerta &&
         prev.fechaTasa === updated.fechaTasa &&
         prev.nombreTienda1 === updated.nombreTienda1 &&
         prev.nombreTienda2 === updated.nombreTienda2 &&
@@ -1107,9 +1239,11 @@ export default function App() {
       } catch (e) {}
     }
 
-    saveEmpresaConfigToFirestore(stamped).catch((err) =>
-      console.warn('Notice syncing empresaConfig to Firestore:', err)
-    );
+    saveEmpresaConfigToFirestore(stamped)
+      .then((ok) => {
+        if (!ok) enqueueSyncOp('firestore_empresa', 'firestore_empresa:main', stamped);
+      })
+      .catch(() => enqueueSyncOp('firestore_empresa', 'firestore_empresa:main', stamped));
 
     logAuditoria(
       'Configuración',
@@ -1161,13 +1295,20 @@ export default function App() {
         return synced;
       });
       if (nextToSave) {
-        saveEmpresaConfigToFirestore(nextToSave).catch(() => {});
+        const payload = nextToSave;
+        saveEmpresaConfigToFirestore(payload)
+          .then((ok) => {
+            if (!ok) enqueueSyncOp('firestore_empresa', 'firestore_empresa:main', payload);
+          })
+          .catch(() => enqueueSyncOp('firestore_empresa', 'firestore_empresa:main', payload));
       }
     }
 
-    saveSucursalesToFirestore(nextSucursales).catch((err) =>
-      console.warn('Notice syncing sucursales to Firestore:', err)
-    );
+    saveSucursalesToFirestore(nextSucursales)
+      .then((ok) => {
+        if (!ok) enqueueSyncOp('firestore_sucursales', 'firestore_sucursales:all', nextSucursales);
+      })
+      .catch(() => enqueueSyncOp('firestore_sucursales', 'firestore_sucursales:all', nextSucursales));
 
     if (auditDescription) {
       logAuditoria('Configuración', 'CREAR', auditDescription, {
@@ -1220,6 +1361,52 @@ export default function App() {
       `Fijación de tasa oficial: 1 USD = ${nuevaTasa.toFixed(2)} Bs (Antes: ${tasaAnterior.toFixed(2)} Bs)`,
       {
         detalles: `Tasa aplicada al sistema en fecha ${new Date().toLocaleDateString('es-VE')}`,
+      }
+    );
+  };
+
+  // Handler: Update global low-stock alert threshold (default 20 units)
+  const handleUpdateStockMinimoAlerta = (nuevoLimite: number) => {
+    const sanitized = Math.max(0, Math.min(1000000, Math.round(Number(nuevoLimite) || 0)));
+    let previo = 20;
+    let nextToSave: EmpresaConfig | null = null;
+    const localResetMs = getStoredFactoryResetMs();
+    setEmpresaConfig((prev) => {
+      previo = prev.stockMinimoAlerta ?? 20;
+      const resetMs = Math.max(localResetMs, parseIsoMs(prev.factoryResetAt));
+      const fiscalMs = parseIsoMs(prev.fiscalUpdatedAt);
+      const keepBlank = resetMs > 0 && fiscalMs <= resetMs;
+      const updated: EmpresaConfig = {
+        ...prev,
+        ...(keepBlank
+          ? {
+              nombreEmpresa: '',
+              rif: '',
+              direccionFiscal: '',
+              telefono: '',
+              logoUrl: '',
+              piePaginaTicket: '',
+              fiscalUpdatedAt: '',
+            }
+          : {}),
+        stockMinimoAlerta: sanitized,
+      };
+      saveEmpresaConfig(updated);
+      nextToSave = updated;
+      return updated;
+    });
+    if (nextToSave) {
+      saveEmpresaConfigToFirestore(nextToSave).catch((err) =>
+        console.warn('Notice syncing stockMinimoAlerta to Firestore:', err)
+      );
+    }
+
+    logAuditoria(
+      'Inventario',
+      'MODIFICAR',
+      `Actualización de umbral global de alerta por stock bajo: < ${sanitized} un. (Antes: < ${previo} un.)`,
+      {
+        detalles: `Aplicado a productos sin mínimo individual en tiendas.`,
       }
     );
   };
@@ -1790,7 +1977,8 @@ export default function App() {
     unidadMedida?: string,
     imagen?: string,
     descripcion?: string,
-    destacadoTienda?: boolean
+    destacadoTienda?: boolean,
+    stockMinimo?: number
   ) => {
     const newProdId = Math.max(...productos.map((p) => p.id), 0) + 1;
     const newProd: Producto = {
@@ -1805,6 +1993,9 @@ export default function App() {
       descripcion: descripcion || '',
       imagen: imagen || '',
       destacadoTienda: destacadoTienda !== undefined ? destacadoTienda : true,
+      ...(typeof stockMinimo === 'number' && !Number.isNaN(stockMinimo) && stockMinimo >= 0
+        ? { stock_minimo: Math.round(stockMinimo) }
+        : {}),
     };
     setProductos((prev) => [...prev, newProd]);
 
@@ -1830,9 +2021,18 @@ export default function App() {
     }));
     setInventario((prev) => [...prev, ...newInvItems]);
 
-    // Sync to Firestore
-    saveProductToFirestore(newProd).catch(() => {});
-    saveInventarioToFirestore([...inventario, ...newInvItems]).catch(() => {});
+    // Sync to Firestore with persistent offline retry queue
+    const nextInventory = [...inventario, ...newInvItems];
+    saveProductToFirestore(newProd)
+      .then((ok) => {
+        if (!ok) enqueueSyncOp('firestore_product', `firestore_product:${newProd.id}`, newProd);
+      })
+      .catch(() => enqueueSyncOp('firestore_product', `firestore_product:${newProd.id}`, newProd));
+    saveInventarioToFirestore(nextInventory)
+      .then((ok) => {
+        if (!ok) enqueueSyncOp('firestore_inventario', 'firestore_inventario:all', nextInventory);
+      })
+      .catch(() => enqueueSyncOp('firestore_inventario', 'firestore_inventario:all', nextInventory));
 
     logAuditoria(
       'Inventario',
@@ -1847,7 +2047,11 @@ export default function App() {
   // Handler: Update product
   const handleUpdateProduct = (updated: Producto) => {
     setProductos((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
-    saveProductToFirestore(updated).catch(() => {});
+    saveProductToFirestore(updated)
+      .then((ok) => {
+        if (!ok) enqueueSyncOp('firestore_product', `firestore_product:${updated.id}`, updated);
+      })
+      .catch(() => enqueueSyncOp('firestore_product', `firestore_product:${updated.id}`, updated));
 
     logAuditoria(
       'Inventario',
@@ -1866,9 +2070,19 @@ export default function App() {
     const nextInv = inventario.filter((i) => i.producto_id !== productId);
     setInventario(nextInv);
 
-    // Sync deletion to Firestore
-    deleteProductFromFirestore(productId).catch(() => {});
-    saveInventarioToFirestore(nextInv).catch(() => {});
+    // Sync deletion to Firestore with offline queue fallback
+    deleteProductFromFirestore(productId)
+      .then((ok) => {
+        if (!ok) enqueueSyncOp('firestore_delete_product', `firestore_delete_product:${productId}`, { id: productId });
+      })
+      .catch(() =>
+        enqueueSyncOp('firestore_delete_product', `firestore_delete_product:${productId}`, { id: productId })
+      );
+    saveInventarioToFirestore(nextInv)
+      .then((ok) => {
+        if (!ok) enqueueSyncOp('firestore_inventario', 'firestore_inventario:all', nextInv);
+      })
+      .catch(() => enqueueSyncOp('firestore_inventario', 'firestore_inventario:all', nextInv));
 
     logAuditoria(
       'Inventario',
@@ -2164,8 +2378,9 @@ export default function App() {
   };
 
   // Handler: Full Database & Application Reset (Factory Reset)
-  const handleResetAllData = () => {
+  const handleResetAllData = (verifiedAdminPin?: string) => {
     const resetIso = new Date().toISOString();
+    clearPendingSyncOps();
 
     // Snapshot General Manager + established PIN BEFORE clearing localStorage
     let storedUsersRaw: Usuario[] = [];
@@ -2332,17 +2547,21 @@ export default function App() {
       localStorage.setItem(STORAGE_KEYS.pedidos_online, JSON.stringify([]));
     } catch (e) {}
 
-    // Persist reset to Backend JSON DB & Cloud Firestore, then refresh live BCV quote
-    fetch('/api/system/factory-reset', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        empresaConfig: cleanEmpresa,
-        tiendaConfig: cleanTienda,
-        sucursales: cleanSucursales,
-        factoryResetAt: resetIso,
-      }),
-    }).catch(() => {});
+    // Persist authenticated reset to Backend JSON DB & Cloud Firestore, then refresh live BCV quote
+    void ensurePosSessionToken(cleanUsuarios[0]).then(() =>
+      fetch('/api/system/factory-reset', {
+        method: 'POST',
+        headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          empresaConfig: cleanEmpresa,
+          tiendaConfig: cleanTienda,
+          sucursales: cleanSucursales,
+          factoryResetAt: resetIso,
+          confirmWord: 'REINICIAR',
+          ...(verifiedAdminPin ? { adminPin: verifiedAdminPin } : {}),
+        }),
+      }).catch(() => {})
+    );
 
     sanitizeUsersForStorage(cleanUsuarios).then(async (sanitizedClean) => {
       setUsuarios(sanitizedClean);
@@ -2378,9 +2597,10 @@ export default function App() {
             localStorage.setItem('pos_last_bcv_auto_sync_date', todayStr);
           } catch (e) {}
           saveEmpresaConfigToFirestore(refreshedEmpresa).catch(() => {});
+          await ensurePosSessionToken(sanitizedClean[0]);
           fetch('/api/sync/state', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
               empresaConfig: refreshedEmpresa,
               sucursales: cleanSucursales,
@@ -2394,29 +2614,49 @@ export default function App() {
     setActiveTab('dashboard');
   };
 
-  // Handler: Restore full database from JSON backup file
+  // Handler: Restore full database from JSON backup file & synchronize to server/cloud
   const handleRestoreDatabase = (backupData: any) => {
     if (!backupData) return;
+    clearPendingSyncOps();
+
+    const restoredEmpresa: EmpresaConfig = backupData.empresaConfig
+      ? {
+          ...CLEAN_EMPRESA_CONFIG,
+          ...backupData.empresaConfig,
+          fiscalUpdatedAt: backupData.empresaConfig.fiscalUpdatedAt || new Date().toISOString(),
+        }
+      : empresaConfig;
 
     if (backupData.empresaConfig) {
-      setEmpresaConfig(backupData.empresaConfig);
-      saveEmpresaConfig(backupData.empresaConfig);
+      setEmpresaConfig(restoredEmpresa);
+      saveEmpresaConfig(restoredEmpresa);
     }
+
+    const restoredSucursales: Sucursal[] =
+      Array.isArray(backupData.sucursales) && backupData.sucursales.length > 0
+        ? backupData.sucursales
+        : sucursales;
     if (Array.isArray(backupData.sucursales) && backupData.sucursales.length > 0) {
-      setSucursales(backupData.sucursales);
-      try { localStorage.setItem(STORAGE_KEYS.sucursales, JSON.stringify(backupData.sucursales)); } catch (e) {}
+      setSucursales(restoredSucursales);
+      try { localStorage.setItem(STORAGE_KEYS.sucursales, JSON.stringify(restoredSucursales)); } catch (e) {}
     }
+
     if (Array.isArray(backupData.usuarios) && backupData.usuarios.length > 0) {
       void persistUsuarios(backupData.usuarios);
     }
+
+    const restoredProductos: Producto[] = Array.isArray(backupData.productos) ? backupData.productos : productos;
     if (Array.isArray(backupData.productos)) {
-      setProductos(backupData.productos);
-      try { localStorage.setItem(STORAGE_KEYS.productos, JSON.stringify(backupData.productos)); } catch (e) {}
+      setProductos(restoredProductos);
+      try { localStorage.setItem(STORAGE_KEYS.productos, JSON.stringify(restoredProductos)); } catch (e) {}
     }
+
+    const restoredInventario: InventarioItem[] = Array.isArray(backupData.inventario) ? backupData.inventario : inventario;
     if (Array.isArray(backupData.inventario)) {
-      setInventario(backupData.inventario);
-      try { localStorage.setItem(STORAGE_KEYS.inventario, JSON.stringify(backupData.inventario)); } catch (e) {}
+      setInventario(restoredInventario);
+      try { localStorage.setItem(STORAGE_KEYS.inventario, JSON.stringify(restoredInventario)); } catch (e) {}
     }
+
     if (Array.isArray(backupData.ventas)) {
       setVentas(backupData.ventas);
       try { localStorage.setItem(STORAGE_KEYS.ventas, JSON.stringify(backupData.ventas)); } catch (e) {}
@@ -2441,13 +2681,17 @@ export default function App() {
       setCxpList(backupData.cxp);
       try { localStorage.setItem(STORAGE_KEYS.cxp, JSON.stringify(backupData.cxp)); } catch (e) {}
     }
+
+    const restoredPedidos: PedidoOnline[] = Array.isArray(backupData.pedidosOnline) ? backupData.pedidosOnline : pedidosOnline;
     if (Array.isArray(backupData.pedidosOnline)) {
-      setPedidosOnline(backupData.pedidosOnline);
-      try { localStorage.setItem(STORAGE_KEYS.pedidos_online, JSON.stringify(backupData.pedidosOnline)); } catch (e) {}
+      setPedidosOnline(restoredPedidos);
+      try { localStorage.setItem(STORAGE_KEYS.pedidos_online, JSON.stringify(restoredPedidos)); } catch (e) {}
     }
+
+    const restoredTienda: TiendaConfig = backupData.tiendaConfig || tiendaConfig;
     if (backupData.tiendaConfig) {
-      setTiendaConfig(backupData.tiendaConfig);
-      try { localStorage.setItem(STORAGE_KEYS.tienda_config, JSON.stringify(backupData.tiendaConfig)); } catch (e) {}
+      setTiendaConfig(restoredTienda);
+      try { localStorage.setItem(STORAGE_KEYS.tienda_config, JSON.stringify(restoredTienda)); } catch (e) {}
     }
     if (backupData.correlativoX !== undefined) {
       setCorrelativoX(backupData.correlativoX);
@@ -2457,6 +2701,37 @@ export default function App() {
       setCorrelativoZ(backupData.correlativoZ);
       try { localStorage.setItem('pos_correlativo_z', String(backupData.correlativoZ)); } catch (e) {}
     }
+
+    // Reconcile restored database with Cloud Firestore & backend server sync (queued if offline)
+    syncAllToFirestore({
+      productos: restoredProductos,
+      empresaConfig: restoredEmpresa,
+      tiendaConfig: restoredTienda,
+      sucursales: restoredSucursales,
+      inventario: restoredInventario,
+    }).catch(() => {});
+
+    const syncRestorePayload = {
+      empresaConfig: restoredEmpresa,
+      tiendaConfig: restoredTienda,
+      sucursales: restoredSucursales,
+      productos: restoredProductos,
+      inventario: restoredInventario,
+      pedidos: restoredPedidos,
+      replacePedidos: true,
+      clientFactoryResetAt: localStorage.getItem(STORAGE_KEY_FACTORY_RESET_AT) || null,
+    };
+    void ensurePosSessionToken(currentUser).then(() =>
+      fetch('/api/sync/state', {
+        method: 'POST',
+        headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(syncRestorePayload),
+      })
+        .then((r) => {
+          if (!r.ok) enqueueSyncOp('sync_state', 'sync_state:latest', syncRestorePayload);
+        })
+        .catch(() => enqueueSyncOp('sync_state', 'sync_state:latest', syncRestorePayload))
+    );
 
     const restoreEntry = createAuditEntry(
       currentUser,
@@ -2487,10 +2762,12 @@ export default function App() {
       localStorage.setItem(STORAGE_KEYS.tienda_config, JSON.stringify(newConfig));
     } catch (e) {}
 
-    // Sync to Firebase Firestore in Google Cloud
-    saveTiendaConfigToFirestore(newConfig).catch((err) =>
-      console.warn('Notice saving tiendaConfig to Firestore:', err)
-    );
+    // Sync to Firebase Firestore in Google Cloud with offline retry queue
+    saveTiendaConfigToFirestore(newConfig)
+      .then((ok) => {
+        if (!ok) enqueueSyncOp('firestore_tienda', 'firestore_tienda:main', newConfig);
+      })
+      .catch(() => enqueueSyncOp('firestore_tienda', 'firestore_tienda:main', newConfig));
 
     logAuditoria(
       'Configuración',
@@ -2536,7 +2813,13 @@ export default function App() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(nuevoPedido),
-    }).catch((err) => console.error('Error enviando pedido al servidor:', err));
+    })
+      .then((res) => {
+        if (!res.ok && res.status >= 500) {
+          enqueueSyncOp('pedido_create', `pedido_create:${nuevoPedido.id}`, nuevoPedido);
+        }
+      })
+      .catch(() => enqueueSyncOp('pedido_create', `pedido_create:${nuevoPedido.id}`, nuevoPedido));
 
     // Ensure customer is registered in client directory if not already present
     setClientes((prevClientes) => {
@@ -2600,12 +2883,21 @@ export default function App() {
       console.error('Error actualizando pedido en Firestore:', err)
     );
 
-    // Sync status update with backend server
-    fetch(`/api/pedidos/${pedidoId}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ estado: nuevoEstado }),
-    }).catch((err) => console.error('Error actualizando pedido en servidor:', err));
+    // Sync authenticated status update with backend server (queued on failure)
+    const patchBody = { estado: nuevoEstado };
+    void ensurePosSessionToken(currentUser).then(() =>
+      fetch(`/api/pedidos/${encodeURIComponent(pedidoId)}`, {
+        method: 'PATCH',
+        headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(patchBody),
+      })
+        .then((r) => {
+          if (!r.ok && r.status !== 404) {
+            enqueueSyncOp('pedido_patch', `pedido_patch:${pedidoId}`, { id: pedidoId, body: patchBody });
+          }
+        })
+        .catch(() => enqueueSyncOp('pedido_patch', `pedido_patch:${pedidoId}`, { id: pedidoId, body: patchBody }))
+    );
   };
 
   // Handler: Facturar pedido web al POS (convierte pedido en venta oficial y descuenta inventario)
@@ -2694,11 +2986,22 @@ export default function App() {
       ventaIdGenerada: newVentaId,
     }).catch((err) => console.error('Error actualizando pedido facturado en Firestore:', err));
 
-    fetch(`/api/pedidos/${pedido.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ estado: 'entregado', correlativoFactura: newVentaId }),
-    }).catch((err) => console.error('Error facturando pedido en servidor:', err));
+    const billedPatchBody = { estado: 'entregado', correlativoFactura: newVentaId };
+    void ensurePosSessionToken(currentUser).then(() =>
+      fetch(`/api/pedidos/${encodeURIComponent(pedido.id)}`, {
+        method: 'PATCH',
+        headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(billedPatchBody),
+      })
+        .then((r) => {
+          if (!r.ok && r.status !== 404) {
+            enqueueSyncOp('pedido_patch', `pedido_patch:${pedido.id}`, { id: pedido.id, body: billedPatchBody });
+          }
+        })
+        .catch(() =>
+          enqueueSyncOp('pedido_patch', `pedido_patch:${pedido.id}`, { id: pedido.id, body: billedPatchBody })
+        )
+    );
 
     logAuditoria(
       'POS / Ventas',
@@ -2935,6 +3238,7 @@ export default function App() {
                     onAddProduct={handleAddProduct}
                     onUpdateProduct={handleUpdateProduct}
                     onDeleteProduct={handleDeleteProduct}
+                    onUpdateStockMinimoAlerta={handleUpdateStockMinimoAlerta}
                     proveedores={proveedores}
                     onRegistrarCompra={handleRegistrarCompra}
                     onAddProveedor={handleAddProveedor}

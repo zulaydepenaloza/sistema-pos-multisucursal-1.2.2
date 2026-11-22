@@ -25,6 +25,7 @@ interface ServerDatabase {
   productos: any[] | null;
   inventario: any[] | null;
   factoryResetAt?: string | null;
+  adminPinHashes?: Record<string, string>;
 }
 
 function parseIsoMsServer(val: unknown): number {
@@ -116,15 +117,273 @@ function saveServerDb(db: ServerDatabase) {
   }
 }
 
-// Middleware for parsing JSON with generous limit for images and PDFs
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+const VALID_ROLES = new Set(['admin', 'supervisor', 'cajero', 'inventario']);
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const SESSION_SECRET_FILE = path.join(DB_DIR, '.session_secret');
+const PIN_SALT_SHARED = 'OMNIPOS_ENTERPRISE_PIN_SALT_2026';
+const FORBIDDEN_KEYS = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+  'pin',
+  'pinHash',
+  'password',
+  'apiKey',
+  'geminiApiKey',
+  'devSecret',
+]);
 
-// Enable CORS and preflight handling for all /api routes
+let cachedSessionSecret: string | null = null;
+export function getOrInitSessionSecret(): string {
+  if (cachedSessionSecret) return cachedSessionSecret;
+  const fromEnv = (process.env.SESSION_SECRET || process.env.JWT_SECRET || '').trim();
+  if (fromEnv && fromEnv.length >= 16) {
+    cachedSessionSecret = fromEnv;
+    return cachedSessionSecret;
+  }
+  try {
+    if (!fs.existsSync(DB_DIR)) {
+      fs.mkdirSync(DB_DIR, { recursive: true });
+    }
+    if (fs.existsSync(SESSION_SECRET_FILE)) {
+      const stored = fs.readFileSync(SESSION_SECRET_FILE, 'utf-8').trim();
+      if (stored.length >= 32) {
+        cachedSessionSecret = stored;
+        return cachedSessionSecret;
+      }
+    }
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(SESSION_SECRET_FILE, generated, { encoding: 'utf-8', mode: 0o600 });
+    cachedSessionSecret = generated;
+    return cachedSessionSecret;
+  } catch {
+    cachedSessionSecret = crypto.randomBytes(32).toString('hex');
+    return cachedSessionSecret;
+  }
+}
+
+export function timingSafeEqualStr(a: string, b: string): boolean {
+  const hashA = crypto.createHash('sha256').update(a).digest();
+  const hashB = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
+function getConfiguredDevSecret(): string {
+  return (process.env.ADMIN_DEV_KEY || 'OmniPosDev2026MasterKey').trim();
+}
+
+export function verifyDevToken(rawToken?: string | null): boolean {
+  if (!rawToken || typeof rawToken !== 'string') return false;
+  const clean = rawToken.trim();
+  if (!clean) return false;
+  return timingSafeEqualStr(clean, getConfiguredDevSecret());
+}
+
+export function hashPinServer(pin: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${pin.trim()}::${PIN_SALT_SHARED}`)
+    .digest('hex');
+}
+
+export function verifyPinAgainstHash(enteredPin: string, storedSha256Hash: string): boolean {
+  if (!enteredPin || !storedSha256Hash || !/^[a-f0-9]{64}$/i.test(storedSha256Hash.trim())) {
+    return false;
+  }
+  return timingSafeEqualStr(hashPinServer(enteredPin), storedSha256Hash.trim().toLowerCase());
+}
+
+export interface PosSessionClaims {
+  userId: number;
+  rol: string;
+  machineId: string;
+  pinVerified: boolean;
+  iat: number;
+  exp: number;
+}
+
+export function signPosSessionToken(claims: {
+  userId: number;
+  rol: string;
+  machineId: string;
+  pinVerified?: boolean;
+}, ttlMs = SESSION_TTL_MS): { token: string; expiresAt: number } {
+  const now = Date.now();
+  const payload: PosSessionClaims = {
+    userId: claims.userId,
+    rol: claims.rol,
+    machineId: claims.machineId,
+    pinVerified: Boolean(claims.pinVerified),
+    iat: now,
+    exp: now + ttlMs,
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf-8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  const sigHex = crypto
+    .createHmac('sha256', getOrInitSessionSecret())
+    .update(payloadB64)
+    .digest('hex');
+  return { token: `${payloadB64}.${sigHex}`, expiresAt: payload.exp };
+}
+
+export function verifyPosSessionToken(token?: string | null): PosSessionClaims | null {
+  if (!token || typeof token !== 'string') return null;
+  const dotIdx = token.lastIndexOf('.');
+  if (dotIdx <= 0) return null;
+  const payloadB64 = token.slice(0, dotIdx).trim();
+  const sigHex = token.slice(dotIdx + 1).trim();
+  if (!payloadB64 || !/^[a-f0-9]{64}$/i.test(sigHex)) return null;
+
+  const expectedHex = crypto
+    .createHmac('sha256', getOrInitSessionSecret())
+    .update(payloadB64)
+    .digest('hex');
+  if (!timingSafeEqualStr(sigHex.toLowerCase(), expectedHex.toLowerCase())) {
+    return null;
+  }
+
+  try {
+    const stdB64 = payloadB64.replace(/-/g, '+').replace(/_/g, '/');
+    const decoded = JSON.parse(Buffer.from(stdB64, 'base64').toString('utf-8')) as PosSessionClaims;
+    if (
+      !decoded ||
+      typeof decoded.userId !== 'number' ||
+      !VALID_ROLES.has(decoded.rol) ||
+      typeof decoded.exp !== 'number' ||
+      decoded.exp <= Date.now()
+    ) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+export function sanitizeRecordKeys<T>(input: T): T {
+  if (Array.isArray(input)) {
+    return input.map((item) => sanitizeRecordKeys(item)) as unknown as T;
+  }
+  if (input && typeof input === 'object') {
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(input as Record<string, any>)) {
+      if (FORBIDDEN_KEYS.has(k)) continue;
+      out[k] = sanitizeRecordKeys(v);
+    }
+    return out as T;
+  }
+  return input;
+}
+
+function getClientIp(req: express.Request): string {
+  const rawIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
+  return String(rawIp).split(',')[0].trim();
+}
+
+function auditSecurityEvent(req: express.Request, action: string, detail: string) {
+  console.warn(`[SECURITY AUDIT] ${new Date().toISOString()} ip=${getClientIp(req)} action=${action} detail="${detail}"`);
+}
+
+function requirePosSession(allowedRoles: string[]) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const adminHeader = typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'] : '';
+    if (adminHeader && verifyDevToken(adminHeader)) {
+      (req as any).posSession = { userId: 0, rol: 'admin', machineId: 'DEV_MASTER', pinVerified: true, isDevMaster: true };
+      return next();
+    }
+
+    const sessionHeader = typeof req.headers['x-pos-session'] === 'string' ? req.headers['x-pos-session'] : '';
+    const claims = verifyPosSessionToken(sessionHeader);
+    if (!claims) {
+      auditSecurityEvent(req, 'UNAUTHORIZED_API', `${req.method} ${req.path}`);
+      return res.status(401).json({
+        success: false,
+        error: 'Sesión POS no autenticada o expirada.',
+      });
+    }
+
+    if (!allowedRoles.includes(claims.rol)) {
+      auditSecurityEvent(req, 'FORBIDDEN_ROLE', `${req.method} ${req.path} rol=${claims.rol}`);
+      return res.status(403).json({
+        success: false,
+        error: 'Permisos insuficientes para realizar esta operación.',
+      });
+    }
+
+    (req as any).posSession = claims;
+    next();
+  };
+}
+
+// Route-scoped JSON body size limits (prevents 50MB DoS exposure on standard routes)
+const jsonParserSmall = express.json({ limit: '2mb' });
+const jsonParserSync = express.json({ limit: '12mb' });
+const jsonParserInvoice = express.json({ limit: '35mb' });
+
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/compras/parse-invoice')) {
+    return jsonParserInvoice(req, res, next);
+  }
+  if (req.path === '/api/sync/state' || req.path === '/api/system/factory-reset') {
+    return jsonParserSync(req, res, next);
+  }
+  return jsonParserSmall(req, res, next);
+});
+app.use(express.urlencoded({ limit: '2mb', extended: true }));
+
+export function isAllowedCorsOrigin(origin?: string, hostHeader?: string): boolean {
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    const normalized = parsed.origin.toLowerCase();
+
+    if (hostHeader) {
+      const hostClean = hostHeader.trim().toLowerCase();
+      if (normalized === `https://${hostClean}` || normalized === `http://${hostClean}`) {
+        return true;
+      }
+    }
+
+    if (
+      parsed.hostname === 'localhost' ||
+      parsed.hostname === '127.0.0.1' ||
+      normalized === 'capacitor://localhost' ||
+      normalized === 'ionic://localhost'
+    ) {
+      return true;
+    }
+
+    const configuredOrigins = [
+      process.env.APP_URL || '',
+      ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : []),
+    ]
+      .map((s) => s.trim().replace(/\/+$/, '').toLowerCase())
+      .filter(Boolean);
+
+    return configuredOrigins.includes(normalized);
+  } catch {
+    return false;
+  }
+}
+
+// Restricted CORS handling for /api routes (no wildcard '*')
 app.use('/api', (req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+  const host = typeof req.headers.host === 'string' ? req.headers.host : undefined;
+
+  if (origin) {
+    if (!isAllowedCorsOrigin(origin, host)) {
+      auditSecurityEvent(req, 'CORS_REJECTED', `origin=${origin}`);
+      return res.status(403).json({ success: false, error: 'Origen no autorizado por política CORS.' });
+    }
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Vary', 'Origin');
+  }
   res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-token, x-requested-with');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-token, x-pos-session, x-requested-with');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
   }
@@ -138,11 +397,11 @@ interface RateLimitConfig {
   message: string;
 }
 
-function createRateLimiter(config: RateLimitConfig) {
+export function createRateLimiter(config: RateLimitConfig) {
   const requests = new Map<string, { count: number; resetTime: number }>();
 
-  // Cleanup expired entries periodically
-  setInterval(() => {
+  // Cleanup expired entries periodically (unref so tests exit cleanly)
+  const timer = setInterval(() => {
     const now = Date.now();
     for (const [key, record] of requests.entries()) {
       if (now > record.resetTime) {
@@ -150,10 +409,10 @@ function createRateLimiter(config: RateLimitConfig) {
       }
     }
   }, 5 * 60 * 1000);
+  if (typeof timer.unref === 'function') timer.unref();
 
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const rawIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
-    const clientIp = String(rawIp).split(',')[0].trim();
+    const clientIp = getClientIp(req);
     const now = Date.now();
     const record = requests.get(clientIp);
 
@@ -183,6 +442,18 @@ const apiGeneralLimiter = createRateLimiter({
   message: 'Demasiadas solicitudes al servidor. Por favor espere un momento.',
 });
 
+const authRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 20,
+  message: 'Demasiados intentos de autenticación. Espere un minuto.',
+});
+
+const resetRateLimiter = createRateLimiter({
+  windowMs: 5 * 60 * 1000,
+  max: 5,
+  message: 'Demasiados intentos de reinicio de fábrica. Espere unos minutos.',
+});
+
 const invoiceRateLimiter = createRateLimiter({
   windowMs: 60 * 1000,
   max: 15,
@@ -203,6 +474,55 @@ const licenseRateLimiter = createRateLimiter({
 
 // Apply general limiter on all /api routes
 app.use('/api', apiGeneralLimiter);
+
+// API: Emisión de token de sesión POS firmado con HMAC-SHA256 de corta duración
+app.post('/api/auth/pos-session', authRateLimiter, (req, res) => {
+  try {
+    const { userId, rol, machineId, pin } = req.body || {};
+    const numId = Number(userId);
+    const cleanRol = typeof rol === 'string' ? rol.trim() : '';
+    const cleanMachine = typeof machineId === 'string' ? machineId.trim().slice(0, 120) : '';
+
+    if (!Number.isFinite(numId) || numId <= 0 || !VALID_ROLES.has(cleanRol) || cleanMachine.length < 4) {
+      return res.status(400).json({
+        success: false,
+        error: 'Datos de sesión inválidos.',
+      });
+    }
+
+    const db = readServerDb();
+    let pinVerified = false;
+    if (typeof pin === 'string' && pin.trim().length > 0) {
+      const storedHash = db.adminPinHashes?.[String(numId)];
+      if (storedHash) {
+        if (!verifyPinAgainstHash(pin, storedHash)) {
+          auditSecurityEvent(req, 'FAILED_POS_SESSION_PIN', `userId=${numId}`);
+          return res.status(401).json({
+            success: false,
+            error: 'PIN incorrecto para iniciar sesión.',
+          });
+        }
+        pinVerified = true;
+      }
+    }
+
+    const { token, expiresAt } = signPosSessionToken({
+      userId: numId,
+      rol: cleanRol,
+      machineId: cleanMachine,
+      pinVerified,
+    });
+
+    return res.json({
+      success: true,
+      token,
+      expiresAt,
+      rol: cleanRol,
+    });
+  } catch {
+    return res.status(500).json({ success: false, error: 'Error interno al crear sesión.' });
+  }
+});
 
 // API Root endpoint: auto-redirects web browsers to POS app (/), returns status for API clients
 app.get(['/api', '/api/'], (req, res) => {
@@ -284,7 +604,7 @@ app.get('/api/bcv-rate', async (req, res) => {
     }
     return res.status(503).json({
       success: false,
-      error: 'No se pudo obtener la tasa BCV automáticamente: ' + err.message,
+      error: 'No se pudo obtener la tasa BCV automáticamente en este momento.',
     });
   }
 });
@@ -294,8 +614,8 @@ app.get('/api/pedidos', (req, res) => {
   try {
     const db = readServerDb();
     res.json({ success: true, pedidos: db.pedidos || [] });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+  } catch {
+    res.status(500).json({ success: false, error: 'Error interno al consultar pedidos.' });
   }
 });
 
@@ -370,7 +690,7 @@ app.post('/api/pedidos', orderRateLimiter, (req, res) => {
 // API: Actualizar estado de pedido con validación de estados permitidos
 const VALID_PEDIDO_STATES = ['pendiente', 'confirmado', 'preparando', 'despachado', 'en_camino', 'entregado', 'cancelado', 'facturado'];
 
-app.patch('/api/pedidos/:id', (req, res) => {
+app.patch('/api/pedidos/:id', requirePosSession(['admin', 'supervisor', 'cajero']), (req, res) => {
   try {
     const { id } = req.params;
     if (!id || typeof id !== 'string' || id.length > 80) {
@@ -421,13 +741,13 @@ app.get('/api/sync/state', (req, res) => {
   }
 });
 
-app.post('/api/sync/state', (req, res) => {
+app.post('/api/sync/state', requirePosSession(['admin', 'supervisor', 'cajero', 'inventario']), (req, res) => {
   try {
     if (!req.body || typeof req.body !== 'object') {
       return res.status(400).json({ success: false, error: 'Cuerpo de sincronización inválido.' });
     }
 
-    const { empresaConfig, tiendaConfig, sucursales, productos, inventario, pedidos, replacePedidos, clientFactoryResetAt } = req.body;
+    const { empresaConfig, tiendaConfig, sucursales, productos, inventario, pedidos, replacePedidos, clientFactoryResetAt, adminPinHashes } = req.body;
     const db = readServerDb();
 
     const serverResetMs = parseIsoMsServer(db.factoryResetAt || db.empresaConfig?.factoryResetAt);
@@ -446,28 +766,30 @@ app.post('/api/sync/state', (req, res) => {
     }
 
     if (empresaConfig && typeof empresaConfig === 'object') {
-      const { cleaned } = sanitizeEmpresaAfterReset(empresaConfig, db.factoryResetAt);
+      const sanitizedEmp = sanitizeRecordKeys(empresaConfig);
+      const { cleaned } = sanitizeEmpresaAfterReset(sanitizedEmp, db.factoryResetAt);
       db.empresaConfig = cleaned;
     }
     if (tiendaConfig && typeof tiendaConfig === 'object') {
-      db.tiendaConfig = tiendaConfig;
+      db.tiendaConfig = sanitizeRecordKeys(tiendaConfig);
     }
     if (Array.isArray(sucursales) && sucursales.length > 0) {
-      db.sucursales = sucursales;
+      db.sucursales = sanitizeRecordKeys(sucursales);
     }
     if (Array.isArray(productos)) {
-      db.productos = productos;
+      db.productos = sanitizeRecordKeys(productos);
     }
     if (Array.isArray(inventario)) {
-      db.inventario = inventario;
+      db.inventario = sanitizeRecordKeys(inventario);
     }
     if (Array.isArray(pedidos)) {
+      const cleanPedidos = sanitizeRecordKeys(pedidos);
       if (replacePedidos) {
-        db.pedidos = pedidos;
+        db.pedidos = cleanPedidos;
       } else {
         const map = new Map();
         (db.pedidos || []).forEach((p: any) => map.set(p.id, p));
-        pedidos.forEach((p: any) => {
+        cleanPedidos.forEach((p: any) => {
           if (p && p.id) map.set(p.id, p);
         });
         db.pedidos = Array.from(map.values()).sort(
@@ -475,6 +797,26 @@ app.post('/api/sync/state', (req, res) => {
         );
       }
     }
+
+    // Store admin PIN hashes strictly server-side for factory-reset/admin session verification (never exposed in GET /api/sync/state)
+    const session = (req as any).posSession;
+    if (session?.rol === 'admin' && Array.isArray(adminPinHashes)) {
+      const nextHashes: Record<string, string> = {};
+      for (const entry of adminPinHashes) {
+        if (
+          entry &&
+          entry.id !== undefined &&
+          typeof entry.pinHash === 'string' &&
+          /^[a-f0-9]{64}$/i.test(entry.pinHash.trim())
+        ) {
+          nextHashes[String(entry.id)] = entry.pinHash.trim().toLowerCase();
+        }
+      }
+      if (Object.keys(nextHashes).length > 0) {
+        db.adminPinHashes = nextHashes;
+      }
+    }
+
     saveServerDb(db);
     res.json({ success: true });
   } catch (err: any) {
@@ -483,27 +825,57 @@ app.post('/api/sync/state', (req, res) => {
   }
 });
 
-// API: Reinicio de fábrica en servidor (limpia pedidos web, catálogo e información fiscal)
-app.post('/api/system/factory-reset', (req, res) => {
+// API: Reinicio de fábrica en servidor (requiere sesión Admin + PIN verificado o Token Maestro)
+app.post('/api/system/factory-reset', resetRateLimiter, requirePosSession(['admin']), (req, res) => {
   try {
-    const { empresaConfig, tiendaConfig, sucursales, factoryResetAt } = req.body || {};
+    const { empresaConfig, tiendaConfig, sucursales, factoryResetAt, adminPin, confirmWord } = req.body || {};
+    const session = (req as any).posSession;
+    const db = readServerDb();
+
+    if (!session?.isDevMaster) {
+      if (String(confirmWord || '').trim().toUpperCase() !== 'REINICIAR') {
+        auditSecurityEvent(req, 'FACTORY_RESET_MISSING_CONFIRM', `userId=${session?.userId}`);
+        return res.status(400).json({
+          success: false,
+          error: 'Confirmación inválida para reinicio de fábrica.',
+        });
+      }
+
+      const knownHashes = Object.values(db.adminPinHashes || {}).filter((h) => /^[a-f0-9]{64}$/i.test(h));
+      if (knownHashes.length > 0) {
+        const cleanPin = typeof adminPin === 'string' ? adminPin.trim() : '';
+        const pinMatch = knownHashes.some((hash) => verifyPinAgainstHash(cleanPin, hash));
+        if (!pinMatch) {
+          auditSecurityEvent(req, 'FACTORY_RESET_INVALID_PIN', `userId=${session?.userId}`);
+          return res.status(403).json({
+            success: false,
+            error: 'PIN de Administrador inválido para ejecutar reinicio de fábrica.',
+          });
+        }
+      }
+    }
+
     const resetStamp = typeof factoryResetAt === 'string' && factoryResetAt ? factoryResetAt : new Date().toISOString();
     const sanitizedEmpresa =
       empresaConfig && typeof empresaConfig === 'object'
-        ? sanitizeEmpresaAfterReset({ ...empresaConfig, factoryResetAt: resetStamp, fiscalUpdatedAt: '' }, resetStamp).cleaned
+        ? sanitizeEmpresaAfterReset(
+            { ...sanitizeRecordKeys(empresaConfig), factoryResetAt: resetStamp, fiscalUpdatedAt: '' },
+            resetStamp
+          ).cleaned
         : null;
 
     const cleanDb: ServerDatabase = {
       pedidos: [],
       empresaConfig: sanitizedEmpresa,
-      tiendaConfig: tiendaConfig && typeof tiendaConfig === 'object' ? tiendaConfig : null,
-      sucursales: Array.isArray(sucursales) && sucursales.length > 0 ? sucursales : null,
+      tiendaConfig: tiendaConfig && typeof tiendaConfig === 'object' ? sanitizeRecordKeys(tiendaConfig) : null,
+      sucursales: Array.isArray(sucursales) && sucursales.length > 0 ? sanitizeRecordKeys(sucursales) : null,
       productos: [],
       inventario: [],
       factoryResetAt: resetStamp,
+      ...(db.adminPinHashes ? { adminPinHashes: db.adminPinHashes } : {}),
     };
     saveServerDb(cleanDb);
-    console.log(`[FACTORY RESET] Base de datos del servidor reiniciada en ${resetStamp}`);
+    auditSecurityEvent(req, 'FACTORY_RESET_EXECUTED', `stamp=${resetStamp}`);
     return res.json({ success: true, factoryResetAt: resetStamp });
   } catch (err: any) {
     console.error('Error en factory-reset del servidor:', err);
@@ -512,13 +884,12 @@ app.post('/api/system/factory-reset', (req, res) => {
 });
 
 // API: Verificación de Token Maestro de Desarrollador (para operaciones protegidas como agregar sucursales)
-app.post('/api/developer/verify-token', licenseRateLimiter, (req, res) => {
+app.post('/api/developer/verify-token', authRateLimiter, licenseRateLimiter, (req, res) => {
   try {
     const rawToken =
       (req.body && typeof req.body.token === 'string' ? req.body.token : '') ||
       (typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'] : '');
     const token = rawToken.trim();
-    const validSecret = (process.env.ADMIN_DEV_KEY || 'OmniPosDev2026MasterKey').trim();
 
     if (!token) {
       return res.status(403).json({
@@ -527,10 +898,8 @@ app.post('/api/developer/verify-token', licenseRateLimiter, (req, res) => {
       });
     }
 
-    const tokenDigest = crypto.createHash('sha256').update(token).digest();
-    const secretDigest = crypto.createHash('sha256').update(validSecret).digest();
-
-    if (!crypto.timingSafeEqual(tokenDigest, secretDigest)) {
+    if (!verifyDevToken(token)) {
+      auditSecurityEvent(req, 'INVALID_DEV_TOKEN', '/api/developer/verify-token');
       return res.status(403).json({
         success: false,
         error: 'Token Maestro de Desarrollador inválido. Solo el desarrollador autorizado puede crear nuevas sucursales.',
@@ -544,17 +913,16 @@ app.post('/api/developer/verify-token', licenseRateLimiter, (req, res) => {
   }
 });
 
-// Download full repository as a .zip file (Protected - requires developer authorization token)
+// Download full repository as a .zip file (Protected - header token only, no query string secret exposure)
 app.get('/api/download-zip', (req, res) => {
   try {
-    const devToken = (req.query.token as string) || (req.headers['x-admin-token'] as string);
-    const validSecret = process.env.ADMIN_DEV_KEY || 'OmniPosDev2026MasterKey';
+    const devToken = typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'] : '';
 
-    // Verify developer credential to prevent unauthorized source code downloads
-    if (!devToken || devToken !== validSecret) {
+    if (!verifyDevToken(devToken)) {
+      auditSecurityEvent(req, 'UNAUTHORIZED_ZIP_DOWNLOAD', '/api/download-zip');
       return res.status(403).json({
         success: false,
-        error: 'Acceso denegado: Se requiere autorización de desarrollador para descargar el código fuente.',
+        error: 'Acceso denegado: Se requiere autorización de desarrollador mediante cabecera x-admin-token.',
       });
     }
 
@@ -571,7 +939,7 @@ app.get('/api/download-zip', (req, res) => {
     archive.on('error', (err: any) => {
       console.error('Archiver error:', err);
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Error generating zip: ' + err.message });
+        res.status(500).json({ success: false, error: 'Error al generar el archivo comprimido.' });
       }
     });
 
@@ -598,7 +966,7 @@ app.get('/api/download-zip', (req, res) => {
   } catch (err: any) {
     console.error('Error generating zip:', err);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Error generating zip: ' + err.message });
+      res.status(500).json({ success: false, error: 'Error al generar el archivo comprimido.' });
     }
   }
 });
@@ -617,13 +985,15 @@ function signLicensePayloadEd25519(base64Payload: string, machineId: string): st
 }
 
 // Protected Developer License Generator Endpoint (Requires Master Developer Secret)
-app.post('/api/developer/license/generate', licenseRateLimiter, (req, res) => {
+app.post('/api/developer/license/generate', authRateLimiter, licenseRateLimiter, (req, res) => {
   try {
-    const { machineId, empresa, rif, tipo, fechaEmision, fechaVencimiento, cajasMax, sucursalesMax, devSecret } = req.body;
-    const token = devSecret || (req.headers['x-admin-token'] as string);
-    const validSecret = process.env.ADMIN_DEV_KEY || 'OmniPosDev2026MasterKey';
+    const { machineId, empresa, rif, tipo, fechaEmision, fechaVencimiento, cajasMax, sucursalesMax, devSecret } = req.body || {};
+    const token =
+      (typeof devSecret === 'string' && devSecret) ||
+      (typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'] : '');
 
-    if (!token || token !== validSecret) {
+    if (!verifyDevToken(token)) {
+      auditSecurityEvent(req, 'UNAUTHORIZED_LICENSE_GENERATE', '/api/developer/license/generate');
       return res.status(403).json({
         success: false,
         error: 'Acceso denegado: Se requiere la clave maestra de desarrollador para emitir licencias.',
@@ -717,7 +1087,7 @@ app.post('/api/developer/license/trial', licenseRateLimiter, (req, res) => {
     });
   } catch (err: any) {
     console.error('Error issuing trial license:', err);
-    return res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: 'Error interno al emitir licencia de prueba.' });
   }
 });
 
@@ -757,7 +1127,7 @@ interface InvoiceParseJob {
 const invoiceParseJobs = new Map<string, InvoiceParseJob>();
 
 // Cleanup finished/expired invoice parse jobs every 5 minutes
-setInterval(() => {
+const invoiceCleanupTimer = setInterval(() => {
   const cutoff = Date.now() - 15 * 60 * 1000;
   for (const [id, job] of invoiceParseJobs.entries()) {
     if (job.createdAt < cutoff) {
@@ -765,6 +1135,7 @@ setInterval(() => {
     }
   }
 }, 5 * 60 * 1000);
+if (typeof invoiceCleanupTimer.unref === 'function') invoiceCleanupTimer.unref();
 
 const INVOICE_PROMPT_TEXT = `
 Eres un asistente contable y administrativo de alta precisión especializado en facturas comerciales y notas de entrega de proveedores (incluyendo facturación venezolana con IVA 16%, exentos (E), gravados (G), RIF, número de control, y códigos de barra).
@@ -1077,7 +1448,7 @@ function validateInvoiceUploadInput(body: any): { cleanBase64: string; normalize
 }
 
 // Asynchronous Job Start endpoint (prevents upstream 504 Gateway Timeouts on large/complex invoices)
-app.post('/api/compras/parse-invoice/start', invoiceRateLimiter, (req, res) => {
+app.post('/api/compras/parse-invoice/start', requirePosSession(['admin', 'supervisor', 'inventario']), invoiceRateLimiter, (req, res) => {
   const validation = validateInvoiceUploadInput(req.body);
   if ('error' in validation) {
     return res.status(validation.status).json({
@@ -1116,7 +1487,7 @@ app.post('/api/compras/parse-invoice/start', invoiceRateLimiter, (req, res) => {
 });
 
 // Asynchronous Job Status Polling endpoint (responds immediately in < 5ms)
-app.get('/api/compras/parse-invoice/status/:jobId', (req, res) => {
+app.get('/api/compras/parse-invoice/status/:jobId', requirePosSession(['admin', 'supervisor', 'inventario']), (req, res) => {
   const { jobId } = req.params;
   const job = invoiceParseJobs.get(jobId);
   if (!job) {
@@ -1156,7 +1527,7 @@ app.get('/api/compras/parse-invoice/status/:jobId', (req, res) => {
 });
 
 // Synchronous endpoint (kept for direct/legacy callers, upgraded to gemini-4-hydrogen)
-app.post('/api/compras/parse-invoice', invoiceRateLimiter, async (req, res) => {
+app.post('/api/compras/parse-invoice', requirePosSession(['admin', 'supervisor', 'inventario']), invoiceRateLimiter, async (req, res) => {
   try {
     const validation = validateInvoiceUploadInput(req.body);
     if ('error' in validation) {
@@ -1221,10 +1592,18 @@ async function startServer() {
     });
   }
 
+  if (!process.env.ADMIN_DEV_KEY) {
+    console.warn('[SECURITY NOTICE] Variable ADMIN_DEV_KEY no definida; usando clave de desarrollo local únicamente en backend.');
+  }
+
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT} [Modo: ${isProduction ? 'Producción' : 'Desarrollo'}]`);
   });
 }
 
-startServer();
+if (process.env.SKIP_SERVER_LISTEN !== '1') {
+  startServer();
+}
+
+export { app };
 

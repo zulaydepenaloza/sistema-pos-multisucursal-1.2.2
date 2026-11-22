@@ -25,6 +25,7 @@ import { Compra, Proveedor, Producto, Sucursal, Usuario, DetalleCompra } from '.
 import { formatUSD, formatBs } from '../lib/currency';
 import { findMatchingProveedor } from '../lib/validations';
 import { WholesalePackConverter } from './WholesalePackConverter';
+import { ensurePosSessionToken, buildPosAuthHeaders } from '../lib/posSession';
 
 interface ParsedItem {
   codigo_barras?: string;
@@ -423,11 +424,13 @@ export const CargarFacturaModal: React.FC<CargarFacturaModalProps> = ({
       const { base64, mimeType } = await optimizeImageFile(selectedFile);
       if (runId !== activeRunIdRef.current) return;
 
+      await ensurePosSessionToken(currentUser);
+
       setProcessingStatus('Enviando factura al motor de lectura IA...');
 
       const startResponse = await fetch('/api/compras/parse-invoice/start', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           fileBase64: base64,
           mimeType,
@@ -470,7 +473,9 @@ export const CargarFacturaModal: React.FC<CargarFacturaModalProps> = ({
         await new Promise((r) => setTimeout(r, 1100));
         if (runId !== activeRunIdRef.current) return;
 
-        const statusRes = await fetch(`/api/compras/parse-invoice/status/${encodeURIComponent(jobId)}`);
+        const statusRes = await fetch(`/api/compras/parse-invoice/status/${encodeURIComponent(jobId)}`, {
+          headers: buildPosAuthHeaders(),
+        });
         const statusText = await statusRes.text();
         let statusJson: any = null;
         try {

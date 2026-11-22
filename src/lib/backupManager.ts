@@ -233,6 +233,11 @@ export function validateAndParseBackupJson(rawJson: string): ValidationBackupRes
             descripcion: String(prod.descripcion || '').slice(0, 300),
             imagen: typeof prod.imagen === 'string' ? prod.imagen : '',
             destacadoTienda: prod.destacadoTienda !== undefined ? Boolean(prod.destacadoTienda) : true,
+            ...(typeof prod.stock_minimo === 'number' &&
+            !isNaN(prod.stock_minimo) &&
+            prod.stock_minimo >= 0
+              ? { stock_minimo: Math.round(prod.stock_minimo) }
+              : {}),
           });
         }
       }

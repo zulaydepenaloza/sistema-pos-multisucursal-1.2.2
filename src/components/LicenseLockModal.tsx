@@ -147,26 +147,35 @@ export const LicenseLockModal: React.FC<LicenseLockModalProps> = ({
       });
 
       const contentType = resp.headers.get('content-type') || '';
-      if (resp.ok && contentType.includes('application/json')) {
-        const data = await resp.json();
-        if (data.success && data.key) {
-          setInputKey(data.key);
-          handleActivate(data.key);
-          setIsSubmittingSupport(false);
-          return;
-        }
+      const data = contentType.includes('application/json') ? await resp.json().catch(() => null) : null;
+
+      if (resp.ok && data?.success && data?.key) {
+        setInputKey(data.key);
+        handleActivate(data.key);
+        setIsSubmittingSupport(false);
+        return;
       }
-    } catch (err: any) {
-      console.warn('Backend API no disponible para soporte, usando generador local autorizado:', err);
+
+      if (!resp.ok) {
+        setErrorMsg(
+          data?.error ||
+            (resp.status === 401 || resp.status === 403
+              ? 'Credencial de soporte rechazada por el servidor.'
+              : `Error del servidor al emitir licencia (HTTP ${resp.status}).`)
+        );
+        setIsSubmittingSupport(false);
+        return;
+      }
+    } catch {
+      // Network unreachable only
     }
 
-    // Fallback de soporte autorizado offline
     const offline = generateOfflineAuthorizedLicense(payload, devSecretKey);
     if (offline.success && offline.key) {
       setInputKey(offline.key);
       handleActivate(offline.key);
     } else {
-      setErrorMsg(offline.error || 'Credencial de autorización rechazada.');
+      setErrorMsg(offline.error || 'No se pudo contactar al servidor de licencias.');
     }
     setIsSubmittingSupport(false);
   };

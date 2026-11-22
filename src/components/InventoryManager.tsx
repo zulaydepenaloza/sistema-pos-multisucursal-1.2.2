@@ -68,10 +68,12 @@ interface InventoryManagerProps {
     unidadMedida?: string,
     imagen?: string,
     descripcion?: string,
-    destacadoTienda?: boolean
+    destacadoTienda?: boolean,
+    stockMinimo?: number
   ) => void;
   onUpdateProduct: (updated: Producto) => void;
   onDeleteProduct: (productId: number) => void;
+  onUpdateStockMinimoAlerta?: (nuevoLimite: number) => void;
   proveedores?: Proveedor[];
   onRegistrarCompra?: (compraData: Omit<Compra, 'id'>, newCatalogProducts?: Producto[]) => void;
   onAddProveedor?: (nuevoProv: Omit<Proveedor, 'id'>) => void;
@@ -88,10 +90,20 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
   onAddProduct,
   onUpdateProduct,
   onDeleteProduct,
+  onUpdateStockMinimoAlerta,
   proveedores = [],
   onRegistrarCompra,
   onAddProveedor,
 }) => {
+  const globalMinStock =
+    typeof empresaConfig.stockMinimoAlerta === 'number' &&
+    !Number.isNaN(empresaConfig.stockMinimoAlerta) &&
+    empresaConfig.stockMinimoAlerta >= 0
+      ? empresaConfig.stockMinimoAlerta
+      : 20;
+
+  const [editingGlobalMinStock, setEditingGlobalMinStock] = useState<boolean>(false);
+  const [globalMinStockInput, setGlobalMinStockInput] = useState<string>(String(globalMinStock));
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [origenId, setOrigenId] = useState<number>(3); // Oficina central by default
   const [destinoId, setDestinoId] = useState<number>(1); // Tienda 1 by default
@@ -131,6 +143,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
   const [newDescripcion, setNewDescripcion] = useState<string>('');
   const [newImagen, setNewImagen] = useState<string>('');
   const [newDestacadoTienda, setNewDestacadoTienda] = useState<boolean>(true);
+  const [newStockMinimo, setNewStockMinimo] = useState<string>('');
 
   // Modal State: Edit Product
   const [editingProduct, setEditingProduct] = useState<Producto | null>(null);
@@ -144,6 +157,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
   const [editDescripcion, setEditDescripcion] = useState<string>('');
   const [editImagen, setEditImagen] = useState<string>('');
   const [editDestacadoTienda, setEditDestacadoTienda] = useState<boolean>(true);
+  const [editStockMinimo, setEditStockMinimo] = useState<string>('');
 
   // Lightbox Preview Modal
   const [previewImageModal, setPreviewImageModal] = useState<{ url: string; nombre: string } | null>(null);
@@ -474,6 +488,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
     setNewDescripcion('');
     setNewImagen('');
     setNewDestacadoTienda(true);
+    setNewStockMinimo('');
     setShowNewProdModal(true);
   };
 
@@ -496,6 +511,11 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
     }
 
     const stockOficina = parseInt(newStockOficina) || 0;
+    const trimmedMin = newStockMinimo.trim();
+    const parsedStockMinimo =
+      trimmedMin !== '' && !Number.isNaN(Number(trimmedMin)) && Number(trimmedMin) >= 0
+        ? Math.round(Number(trimmedMin))
+        : undefined;
 
     onAddProduct(
       newCodigo.trim(),
@@ -508,7 +528,8 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
       newUnidadMedida,
       newImagen,
       newDescripcion.trim(),
-      newDestacadoTienda
+      newDestacadoTienda,
+      parsedStockMinimo
     );
     setShowNewProdModal(false);
   };
@@ -530,6 +551,11 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
     setEditDescripcion(product.descripcion || '');
     setEditImagen(product.imagen || '');
     setEditDestacadoTienda(product.destacadoTienda !== undefined ? product.destacadoTienda : true);
+    setEditStockMinimo(
+      typeof product.stock_minimo === 'number' && !Number.isNaN(product.stock_minimo) && product.stock_minimo >= 0
+        ? String(product.stock_minimo)
+        : ''
+    );
   };
 
   const handleSaveEditProduct = (e: React.FormEvent) => {
@@ -552,8 +578,15 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
       costo = +(precio * 0.7).toFixed(2);
     }
 
+    const trimmedEditMin = editStockMinimo.trim();
+    const parsedEditMin =
+      trimmedEditMin !== '' && !Number.isNaN(Number(trimmedEditMin)) && Number(trimmedEditMin) >= 0
+        ? Math.round(Number(trimmedEditMin))
+        : undefined;
+
+    const { stock_minimo: _ignoredPrevMin, ...restProduct } = editingProduct;
     onUpdateProduct({
-      ...editingProduct,
+      ...restProduct,
       codigo_barras: editCodigo.trim(),
       nombre: editNombre.trim(),
       precio,
@@ -564,6 +597,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
       descripcion: editDescripcion.trim(),
       imagen: editImagen,
       destacadoTienda: editDestacadoTienda,
+      ...(parsedEditMin !== undefined ? { stock_minimo: parsedEditMin } : {}),
     });
 
     setEditingProduct(null);
@@ -735,6 +769,75 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                 className="bg-slate-900 border border-slate-700 text-xs text-white pl-8 pr-3 py-1.5 rounded-xl focus:border-emerald-500 focus:outline-none w-56 sm:w-64"
               />
             </div>
+            {/* Umbral Global de Stock Bajo */}
+            {editingGlobalMinStock && onUpdateStockMinimoAlerta ? (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const val = parseInt(globalMinStockInput, 10);
+                  if (!Number.isNaN(val) && val >= 0) {
+                    onUpdateStockMinimoAlerta(val);
+                  }
+                  setEditingGlobalMinStock(false);
+                }}
+                className="flex items-center gap-1.5 bg-slate-900 border border-rose-500/40 px-2.5 py-1 rounded-xl"
+              >
+                <span className="text-[11px] text-rose-300 font-semibold whitespace-nowrap">
+                  Alerta &lt;
+                </span>
+                <input
+                  type="number"
+                  min="0"
+                  max="1000000"
+                  value={globalMinStockInput}
+                  onChange={(e) => setGlobalMinStockInput(e.target.value)}
+                  className="w-16 bg-slate-950 border border-slate-700 rounded-lg px-2 py-0.5 text-xs font-mono text-white focus:border-rose-400 focus:outline-none"
+                  autoFocus
+                />
+                <span className="text-[10px] text-slate-400">un.</span>
+                <button
+                  type="submit"
+                  className="px-2 py-0.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-[10px] cursor-pointer"
+                >
+                  Guardar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEditingGlobalMinStock(false)}
+                  className="p-0.5 text-slate-400 hover:text-white cursor-pointer"
+                  title="Cancelar"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </form>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!hasInventoryPermission() || !onUpdateStockMinimoAlerta) return;
+                  setGlobalMinStockInput(String(globalMinStock));
+                  setEditingGlobalMinStock(true);
+                }}
+                disabled={!hasInventoryPermission() || !onUpdateStockMinimoAlerta}
+                title={
+                  hasInventoryPermission() && onUpdateStockMinimoAlerta
+                    ? 'Configurar límite global de alerta por stock bajo en tiendas (rojo si es menor a este número)'
+                    : 'Límite global de alerta por stock bajo en tiendas'
+                }
+                className={`text-[11px] font-mono px-2.5 py-1 rounded-full border flex items-center gap-1.5 transition-colors ${
+                  hasInventoryPermission() && onUpdateStockMinimoAlerta
+                    ? 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border-rose-500/30 cursor-pointer'
+                    : 'bg-slate-900 text-slate-400 border-slate-700 cursor-default'
+                }`}
+              >
+                <AlertTriangle className="w-3 h-3 text-rose-400" />
+                <span>Alerta &lt; {globalMinStock} un.</span>
+                {hasInventoryPermission() && onUpdateStockMinimoAlerta && (
+                  <Edit className="w-3 h-3 opacity-70" />
+                )}
+              </button>
+            )}
+
             <span className="hidden md:inline text-[11px] text-emerald-400 font-mono bg-emerald-500/10 px-2.5 py-1 rounded-full border border-emerald-500/20">
               Tasa: 1$ = {formatBs(1, empresaConfig.tasaCambio)}
             </span>
@@ -782,6 +885,11 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                   const marginUSD = prod.precio - cost;
                   const marginPct = prod.precio > 0 ? (marginUSD / prod.precio) * 100 : 0;
                   const isExento = !!prod.exento_iva;
+                  const hasCustomMin =
+                    typeof prod.stock_minimo === 'number' &&
+                    !Number.isNaN(prod.stock_minimo) &&
+                    prod.stock_minimo >= 0;
+                  const prodMinThreshold = hasCustomMin ? (prod.stock_minimo as number) : globalMinStock;
 
                   return (
                     <tr key={prod.id} className="hover:bg-slate-800/40 transition-colors">
@@ -829,12 +937,20 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                             </span>
                           )}
                         </div>
-                        <div className="text-[10px] text-slate-400 font-normal flex items-center gap-2 mt-0.5">
+                        <div className="text-[10px] text-slate-400 font-normal flex flex-wrap items-center gap-2 mt-0.5">
                           <span>ID #{prod.id}</span>
                           <span>•</span>
                           <span className="text-slate-300">{prod.categoria || 'Víveres'}</span>
                           <span>•</span>
                           <span className="text-slate-500">{prod.unidad_medida || 'UND'}</span>
+                          {hasCustomMin && (
+                            <>
+                              <span>•</span>
+                              <span className="text-amber-300 font-mono">
+                                Mín: {prod.stock_minimo} un.
+                              </span>
+                            </>
+                          )}
                         </div>
                       </td>
 
@@ -878,8 +994,9 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                             </span>
                           ) : (
                             <span
+                              title={`Mínimo configurado: ${prodMinThreshold} un.${hasCustomMin ? ' (personalizado)' : ' (global)'}`}
                               className={`px-2.5 py-1 rounded-md text-xs font-mono font-bold ${
-                                stock < 20
+                                stock < prodMinThreshold
                                   ? 'bg-rose-950/80 text-rose-300 border border-rose-500/30'
                                   : 'bg-emerald-950/80 text-emerald-300 border border-emerald-500/30'
                               }`}
@@ -1260,16 +1377,35 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                 </label>
               </div>
 
-              <div>
-                <label className="block text-slate-400 mb-1 font-semibold">Stock Inicial en Bodega Central</label>
-                <input
-                  type="number"
-                  min="0"
-                  value={newStockOficina}
-                  onChange={(e) => setNewStockOficina(e.target.value)}
-                  placeholder="100"
-                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white font-mono focus:border-emerald-500 focus:outline-none"
-                />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-slate-400 mb-1 font-semibold">Stock Inicial en Bodega Central</label>
+                  <input
+                    type="number"
+                    min="0"
+                    value={newStockOficina}
+                    onChange={(e) => setNewStockOficina(e.target.value)}
+                    placeholder="100"
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white font-mono focus:border-emerald-500 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1 font-semibold">
+                    Alerta Stock Mínimo en Tienda (Opcional)
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="1000000"
+                    value={newStockMinimo}
+                    onChange={(e) => setNewStockMinimo(e.target.value)}
+                    placeholder={`Por defecto: ${globalMinStock} un.`}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-amber-300 font-mono focus:border-emerald-500 focus:outline-none"
+                  />
+                  <span className="text-[10px] text-slate-500 block mt-1">
+                    Déjalo vacío para usar el límite global ({globalMinStock} un.).
+                  </span>
+                </div>
               </div>
 
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
@@ -1494,6 +1630,25 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                   <span className="font-bold text-white block">Publicar en Catálogo y Tienda Online</span>
                   <span className="text-[11px] text-slate-400">El producto se mostrará en la tienda web para pedidos y entregas a domicilio.</span>
                 </label>
+              </div>
+
+              {/* Alerta Stock Mínimo Individual */}
+              <div>
+                <label className="block text-slate-400 mb-1 font-semibold">
+                  Alerta Stock Mínimo en Tienda (Opcional)
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  max="1000000"
+                  value={editStockMinimo}
+                  onChange={(e) => setEditStockMinimo(e.target.value)}
+                  placeholder={`Por defecto: ${globalMinStock} un.`}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-amber-300 font-mono focus:border-sky-500 focus:outline-none"
+                />
+                <span className="text-[10px] text-slate-500 block mt-1">
+                  Si una tienda tiene menos de este límite, el recuadro se mostrará en rojo. Déjalo vacío para usar el umbral global ({globalMinStock} un.).
+                </span>
               </div>
 
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
