@@ -123,4 +123,4 @@ Este proyecto está optimizado para poder ser gestionado, versionado y ejecutado
 
 ## 📄 Licencia y Derechos de Autor
 Desarrollado como solución de grado empresarial para comercios, distribuidoras y cadenas de tiendas minoristas.  
-Todos los derechos reservados.
+Todos los derechos reservados. AITech Soluciones.
