@@ -123,6 +123,13 @@ export function downloadBackupJsonFile(payload: BackupDatabasePayload, customFil
 export interface ValidationBackupResult {
   isValid: boolean;
   error?: string;
+  warnings?: string[];
+  rejectedStats?: {
+    productos: number;
+    ventas: number;
+    inventario: number;
+    usuarios: number;
+  };
   payload?: BackupDatabasePayload;
   resumen?: {
     empresa: string;
@@ -214,6 +221,9 @@ export function validateAndParseBackupJson(rawJson: string): ValidationBackupRes
   }
 
   // Deep record-level integrity validation and sanitization
+  const warnings: string[] = [];
+  const rejectedStats = { productos: 0, ventas: 0, inventario: 0, usuarios: 0 };
+
   const sanitizedProductos: any[] = [];
   if (Array.isArray(normalizedData.productos)) {
     for (const prod of normalizedData.productos) {
@@ -239,7 +249,11 @@ export function validateAndParseBackupJson(rawJson: string): ValidationBackupRes
               ? { stock_minimo: Math.round(prod.stock_minimo) }
               : {}),
           });
+        } else {
+          rejectedStats.productos++;
         }
+      } else {
+        rejectedStats.productos++;
       }
     }
   }
@@ -251,7 +265,11 @@ export function validateAndParseBackupJson(rawJson: string): ValidationBackupRes
         const totalNum = Number(v.total);
         if (!isNaN(totalNum) && totalNum >= 0) {
           sanitizedVentas.push(v);
+        } else {
+          rejectedStats.ventas++;
         }
+      } else {
+        rejectedStats.ventas++;
       }
     }
   }
@@ -266,11 +284,16 @@ export function validateAndParseBackupJson(rawJson: string): ValidationBackupRes
         const stockNum = Number(inv.stock);
         if (!isNaN(pId) && !isNaN(sId) && !isNaN(stockNum)) {
           sanitizedInventario.push({
+            id: Number(inv.id) || sanitizedInventario.length + 1,
             producto_id: pId,
             sucursal_id: sId,
             stock: stockNum,
           });
+        } else {
+          rejectedStats.inventario++;
         }
+      } else {
+        rejectedStats.inventario++;
       }
     }
   }
@@ -287,10 +310,26 @@ export function validateAndParseBackupJson(rawJson: string): ValidationBackupRes
           pin: String(u.pin).trim(),
           rol: u.rol || 'cajero',
           sucursal_id: u.sucursal_id !== undefined ? u.sucursal_id : 1,
+          cargo: String(u.cargo || ''),
           permisos: u.permisos || {},
         });
+      } else {
+        rejectedStats.usuarios++;
       }
     }
+  }
+
+  if (rejectedStats.productos > 0) {
+    warnings.push(`${rejectedStats.productos} producto(s) omitido(s) por datos inválidos o precio negativo.`);
+  }
+  if (rejectedStats.ventas > 0) {
+    warnings.push(`${rejectedStats.ventas} venta(s) omitida(s) por formato o total inválido.`);
+  }
+  if (rejectedStats.inventario > 0) {
+    warnings.push(`${rejectedStats.inventario} registro(s) de inventario omitido(s) por campos inválidos.`);
+  }
+  if (rejectedStats.usuarios > 0) {
+    warnings.push(`${rejectedStats.usuarios} usuario(s) omitido(s) por falta de credenciales.`);
   }
 
   // Prevent bricking: if usuarios in backup was empty or corrupt, do not wipe existing users!
@@ -299,6 +338,8 @@ export function validateAndParseBackupJson(rawJson: string): ValidationBackupRes
   normalizedData.inventario = sanitizedInventario;
   if (sanitizedUsuarios.length > 0) {
     normalizedData.usuarios = sanitizedUsuarios;
+  } else if (Array.isArray(normalizedData.usuarios) && normalizedData.usuarios.length > 0) {
+    warnings.push('No se encontraron usuarios válidos en el respaldo; se conservarán los usuarios actuales.');
   }
 
   const payload: BackupDatabasePayload = {
@@ -325,6 +366,8 @@ export function validateAndParseBackupJson(rawJson: string): ValidationBackupRes
 
   return {
     isValid: true,
+    ...(warnings.length > 0 ? { warnings } : {}),
+    rejectedStats,
     payload,
     resumen: {
       empresa: empresaName,

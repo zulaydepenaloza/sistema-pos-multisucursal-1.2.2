@@ -76,6 +76,9 @@ import {
   subscribeToSucursales,
   resetSystemDataInFirestore,
   syncAllToFirestore,
+  subscribeToCloudAuth,
+  CloudAuthUser,
+  consolidateSaleItems,
 } from './lib/firebaseClient';
 import {
   enqueueSyncOp,
@@ -88,7 +91,9 @@ import {
   clearPosSessionToken,
   buildPosAuthHeaders,
 } from './lib/posSession';
+import { fetchApi } from './lib/apiFetch';
 import {
+  hashPin,
   sanitizeUserForSession,
   sanitizeUsersForStorage,
   ensureMinimumFullAdmin,
@@ -148,6 +153,7 @@ function playOrderChime() {
 }
 
 const STORAGE_KEY_FACTORY_RESET_AT = 'pos_factory_reset_at';
+const POS_ACTIVE_OPERATOR_STORAGE_KEY = 'pos_active_operator_v1';
 
 const CLEAN_TIENDA_CONFIG: TiendaConfig = {
   habilitada: true,
@@ -244,9 +250,35 @@ export default function App() {
     return INITIAL_USUARIOS;
   });
   const [currentUser, setCurrentUser] = useState<Usuario | null>(() => {
-    const primaryAdmin = usuarios.find((u) => isFullPrivilegeAdmin(u)) || usuarios[0] || INITIAL_USUARIOS[0];
-    return sanitizeUserForSession(primaryAdmin);
+    try {
+      const raw = sessionStorage.getItem(POS_ACTIVE_OPERATOR_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as Usuario;
+      if (!parsed || typeof parsed.id !== 'number') return null;
+      const matched = usuarios.find((u) => u.id === parsed.id);
+      return matched ? sanitizeUserForSession(matched) : null;
+    } catch {
+      return null;
+    }
   });
+  const [cloudUser, setCloudUser] = useState<CloudAuthUser | null>(null);
+
+  useEffect(() => {
+    try {
+      if (currentUser) {
+        sessionStorage.setItem(POS_ACTIVE_OPERATOR_STORAGE_KEY, JSON.stringify(currentUser));
+      } else {
+        sessionStorage.removeItem(POS_ACTIVE_OPERATOR_STORAGE_KEY);
+      }
+    } catch {}
+  }, [currentUser]);
+
+  useEffect(() => {
+    const unsub = subscribeToCloudAuth((user) => {
+      setCloudUser(user);
+    });
+    return () => unsub();
+  }, []);
 
   // E-Commerce & Online Store State
   const [pedidosOnline, setPedidosOnline] = useState<PedidoOnline[]>(() => {
@@ -682,9 +714,56 @@ export default function App() {
   useEffect(() => {
     let isMounted = true;
 
+    if (isClientStoreMode) {
+      // Public web catalog uses ONLY the sanitized public store endpoint
+      fetch('/api/public/store-state')
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (!data || !data.success || !isMounted) return;
+          if (data.factoryResetAt) {
+            try {
+              const currentReset = getStoredFactoryResetMs();
+              const serverReset = parseIsoMs(data.factoryResetAt);
+              if (serverReset > currentReset) {
+                localStorage.setItem(STORAGE_KEY_FACTORY_RESET_AT, data.factoryResetAt);
+              }
+            } catch (e) {}
+          }
+          if (data.empresaConfig) {
+            applyEmpresaConfigUpdate(data.empresaConfig);
+          }
+          if (data.tiendaConfig) {
+            setTiendaConfig((prev) => ({ ...prev, ...data.tiendaConfig }));
+          }
+          if (Array.isArray(data.sucursales) && data.sucursales.length > 0) {
+            setSucursales(data.sucursales);
+          }
+          if (Array.isArray(data.productos)) {
+            setProductos(data.productos);
+          }
+          if (Array.isArray(data.inventario)) {
+            setInventario(data.inventario);
+          }
+        })
+        .catch(() => {});
+      return () => {
+        isMounted = false;
+      };
+    }
+
+    // POS protected synchronization requires an authenticated operator session
+    if (!currentUser) {
+      return () => {
+        isMounted = false;
+      };
+    }
+
     const fetchServerOrders = async () => {
       try {
-        const res = await fetch('/api/pedidos');
+        await ensurePosSessionToken(currentUser);
+        const res = await fetch('/api/pedidos', {
+          headers: buildPosAuthHeaders(),
+        });
         if (!res.ok) return;
         const data = await res.json();
         if (data.success && Array.isArray(data.pedidos) && isMounted) {
@@ -730,91 +809,64 @@ export default function App() {
 
     fetchServerOrders();
 
-    if (!isClientStoreMode) {
-      // Obtain signed POS session token and broadcast current settings & catalog from POS to server
-      try {
-        const clientResetStamp = localStorage.getItem(STORAGE_KEY_FACTORY_RESET_AT) || null;
-        const adminPinHashes =
-          currentUser?.rol === 'admin'
-            ? usuarios
-                .filter((u) => u.rol === 'admin' && isHashedPin(u.pin))
-                .map((u) => ({ id: u.id, pinHash: u.pin }))
-            : undefined;
-        const syncPayload = {
-          empresaConfig,
-          tiendaConfig,
-          sucursales,
-          productos,
-          inventario,
-          pedidos: pedidosOnline,
-          replacePedidos: true,
-          clientFactoryResetAt: clientResetStamp,
-          ...(adminPinHashes && adminPinHashes.length > 0 ? { adminPinHashes } : {}),
-        };
-        ensurePosSessionToken(currentUser)
-          .then(() =>
-            fetch('/api/sync/state', {
-              method: 'POST',
-              headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
-              body: JSON.stringify(syncPayload),
-            })
-          )
-          .then((res) => (res.ok ? res.json() : null))
-          .then((data) => {
-            if (!data || !isMounted) return;
-            if (data.resetRequired && data.factoryResetAt) {
-              try {
-                localStorage.setItem(STORAGE_KEY_FACTORY_RESET_AT, data.factoryResetAt);
-              } catch (e) {}
-              if (data.empresaConfig) applyEmpresaConfigUpdate(data.empresaConfig);
-              if (data.tiendaConfig) setTiendaConfig((prev) => ({ ...prev, ...data.tiendaConfig }));
-              if (Array.isArray(data.sucursales) && data.sucursales.length > 0) setSucursales(data.sucursales);
-            }
+    // Obtain signed POS session token and broadcast current settings & catalog from POS to server
+    try {
+      const clientResetStamp = localStorage.getItem(STORAGE_KEY_FACTORY_RESET_AT) || null;
+      const adminPinHashes =
+        currentUser?.rol === 'admin'
+          ? usuarios
+              .filter((u) => u.rol === 'admin' && isHashedPin(u.pin))
+              .map((u) => ({ id: u.id, pinHash: u.pin }))
+          : undefined;
+      const userPinHashes =
+        currentUser?.rol === 'admin'
+          ? usuarios
+              .filter((u) => isHashedPin(u.pin))
+              .map((u) => ({ id: u.id, pinHash: u.pin }))
+          : undefined;
+      const syncPayload = {
+        empresaConfig,
+        tiendaConfig,
+        sucursales,
+        productos,
+        inventario,
+        pedidos: pedidosOnline,
+        replacePedidos: true,
+        clientFactoryResetAt: clientResetStamp,
+        ...(adminPinHashes && adminPinHashes.length > 0 ? { adminPinHashes } : {}),
+        ...(userPinHashes && userPinHashes.length > 0 ? { userPinHashes } : {}),
+      };
+      ensurePosSessionToken(currentUser)
+        .then(() =>
+          fetch('/api/sync/state', {
+            method: 'POST',
+            headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify(syncPayload),
           })
-          .catch(() => {
-            enqueueSyncOp('sync_state', 'sync_state:latest', syncPayload);
-          });
-      } catch (e) {}
-    } else {
-      // Pull latest synced catalog & company/store configuration for client link
-      fetch('/api/sync/state')
+        )
         .then((res) => (res.ok ? res.json() : null))
         .then((data) => {
-          if (!data || !data.success || !isMounted) return;
-          if (data.factoryResetAt) {
+          if (!data || !isMounted) return;
+          if (data.resetRequired && data.factoryResetAt) {
             try {
-              const currentReset = getStoredFactoryResetMs();
-              const serverReset = parseIsoMs(data.factoryResetAt);
-              if (serverReset > currentReset) {
-                localStorage.setItem(STORAGE_KEY_FACTORY_RESET_AT, data.factoryResetAt);
-              }
+              localStorage.setItem(STORAGE_KEY_FACTORY_RESET_AT, data.factoryResetAt);
             } catch (e) {}
-          }
-          if (data.empresaConfig) {
-            applyEmpresaConfigUpdate(data.empresaConfig);
-          }
-          if (data.tiendaConfig) {
-            setTiendaConfig((prev) => ({ ...prev, ...data.tiendaConfig }));
-          }
-          if (Array.isArray(data.sucursales) && data.sucursales.length > 0) {
-            setSucursales(data.sucursales);
-          }
-          if (Array.isArray(data.productos)) {
-            setProductos(data.productos);
-          }
-          if (Array.isArray(data.inventario)) {
-            setInventario(data.inventario);
+            if (data.empresaConfig) applyEmpresaConfigUpdate(data.empresaConfig);
+            if (data.tiendaConfig) setTiendaConfig((prev) => ({ ...prev, ...data.tiendaConfig }));
+            if (Array.isArray(data.sucursales) && data.sucursales.length > 0) setSucursales(data.sucursales);
           }
         })
-        .catch(() => {});
-    }
+        .catch(() => {
+          enqueueSyncOp('sync_state', 'sync_state:latest', syncPayload);
+        });
+    } catch (e) {}
 
     const interval = setInterval(fetchServerOrders, 3000);
     return () => {
       isMounted = false;
       clearInterval(interval);
     };
-  }, []);
+  }, [isClientStoreMode, currentUser?.id]);
 
   // Keep server sync state fresh whenever POS catalog or configs change
   useEffect(() => {
@@ -828,6 +880,12 @@ export default function App() {
                 .filter((u) => u.rol === 'admin' && isHashedPin(u.pin))
                 .map((u) => ({ id: u.id, pinHash: u.pin }))
             : undefined;
+        const userPinHashes =
+          currentUser?.rol === 'admin'
+            ? usuarios
+                .filter((u) => isHashedPin(u.pin))
+                .map((u) => ({ id: u.id, pinHash: u.pin }))
+            : undefined;
         const syncPayload = {
           empresaConfig,
           tiendaConfig,
@@ -836,10 +894,11 @@ export default function App() {
           inventario,
           clientFactoryResetAt: clientResetStamp,
           ...(adminPinHashes && adminPinHashes.length > 0 ? { adminPinHashes } : {}),
+          ...(userPinHashes && userPinHashes.length > 0 ? { userPinHashes } : {}),
         };
         ensurePosSessionToken(currentUser)
           .then(() =>
-            fetch('/api/sync/state', {
+            fetchApi('/api/sync/state', {
               method: 'POST',
               headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
               body: JSON.stringify(syncPayload),
@@ -888,7 +947,7 @@ export default function App() {
         switch (op.type) {
           case 'sync_state': {
             await ensurePosSessionToken(currentUser);
-            const r = await fetch('/api/sync/state', {
+            const r = await fetchApi('/api/sync/state', {
               method: 'POST',
               headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
               body: JSON.stringify(op.payload),
@@ -896,7 +955,7 @@ export default function App() {
             return r.ok;
           }
           case 'pedido_create': {
-            const r = await fetch('/api/pedidos', {
+            const r = await fetchApi('/api/pedidos', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(op.payload),
@@ -905,7 +964,7 @@ export default function App() {
           }
           case 'pedido_patch': {
             await ensurePosSessionToken(currentUser);
-            const r = await fetch(`/api/pedidos/${encodeURIComponent(op.payload.id)}`, {
+            const r = await fetchApi(`/api/pedidos/${encodeURIComponent(op.payload.id)}`, {
               method: 'PATCH',
               headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
               body: JSON.stringify(op.payload.body),
@@ -926,13 +985,17 @@ export default function App() {
             return await saveSucursalesToFirestore(op.payload);
           case 'firestore_usuarios':
             return await saveUsuariosToFirestore(op.payload);
+          case 'firestore_venta': {
+            const tx = await registrarVentaTransaccional(op.payload);
+            return tx.success || Boolean(tx.stockFaltante?.length);
+          }
           default:
             return true;
         }
       });
     };
 
-    void ensurePosSessionToken(currentUser, { forceRefresh: true }).then(() => {
+    void ensurePosSessionToken(currentUser).then(() => {
       void runQueueFlush();
     });
 
@@ -1467,8 +1530,10 @@ export default function App() {
     };
   }, [currentUser]);
 
-  // Firebase Firestore Real-Time Subscriptions (Zero suspension, 24/7 Google Cloud)
+  // Firebase Firestore Real-Time Subscriptions (Only active when authenticated with verified Google Cloud user)
   useEffect(() => {
+    if (!cloudUser?.emailVerified) return;
+
     // 1. Silent ping check
     testFirestoreConnection().catch(() => {});
 
@@ -1544,10 +1609,10 @@ export default function App() {
       }
     });
 
-    // 7. Real-time system users & hashed PINs sync from Firestore
+    // 7. Real-time system users & hashed PINs sync from Firestore (read-only hydration, never auto-escalates)
     const unsubUsuarios = subscribeToUsuarios((cloudUsers) => {
       if (cloudUsers && cloudUsers.length > 0) {
-        const { users: safeUsers, repaired } = ensureMinimumFullAdmin(cloudUsers);
+        const { users: safeUsers } = ensureMinimumFullAdmin(cloudUsers);
 
         setUsuarios((prev) => {
           const prevStr = JSON.stringify(prev);
@@ -1564,13 +1629,6 @@ export default function App() {
           const updatedActive = safeUsers.find((u) => u.id === prev.id);
           return updatedActive ? sanitizeUserForSession(updatedActive) : prev;
         });
-
-        // If Firestore contained zero full-privilege admins, immediately heal Firestore too
-        if (repaired) {
-          sanitizeUsersForStorage(safeUsers)
-            .then((sanitized) => saveUsuariosToFirestore(sanitized))
-            .catch((err) => console.warn('Notice healing admin privileges in Firestore:', err));
-        }
       }
     });
 
@@ -1597,7 +1655,7 @@ export default function App() {
       unsubUsuarios();
       unsubSucursales();
     };
-  }, []);
+  }, [cloudUser?.uid, cloudUser?.emailVerified]);
 
 
   // Calculate totals
@@ -1613,9 +1671,12 @@ export default function App() {
     cliente: { id: number | null; nombre: string; rif: string },
     pagoDetalle: DetallePagoVenta
   ): Promise<boolean> => {
+    // Consolidar líneas repetidas del carrito antes de validar y descontar
+    const consolidatedItems = consolidateSaleItems(items);
+
     // 1. Verificación previa de existencias locales en la sucursal activa
     const branchInv = inventario.filter((i) => i.sucursal_id === sucursalId);
-    for (const item of items) {
+    for (const item of consolidatedItems) {
       const invRow = branchInv.find((i) => i.producto_id === item.producto.id);
       const stockDisponible = invRow ? invRow.stock : 0;
       if (stockDisponible < item.cantidad) {
@@ -1638,6 +1699,7 @@ export default function App() {
     const totalVenta = +(Math.max(0, baseImponible + montoIva + montoExento - descuentoUsd)).toFixed(2);
     const newVentaId = ventas.reduce((max, v) => Math.max(max, Number(v.id) || 0), 0) + 1;
     const numeroFactura = String(newVentaId).padStart(8, '0');
+    const txUid = `${newVentaId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
     const detalles = items.map((item, index) => {
       const isExento = !!item.producto.exento_iva;
@@ -1677,12 +1739,14 @@ export default function App() {
       detalles,
     };
     (nuevaVenta as any).numeroFactura = numeroFactura;
+    (nuevaVenta as any).txUid = txUid;
 
-    // 2. Transacción Atómica en Firestore con bloqueo de concurrencia
+    // 2. Transacción Atómica en Firestore con bloqueo de concurrencia e idempotencia
     const txResult = await registrarVentaTransaccional({
       venta: nuevaVenta,
       sucursalId,
-      items,
+      items: consolidatedItems,
+      txUid,
     });
 
     // Detectar conflicto si otro dispositivo agotó el inventario concurrentemente
@@ -1694,6 +1758,21 @@ export default function App() {
         `¡Conflicto de inventario concurrente detectado!\n\nOtro punto de venta acaba de vender las existencias de:\n${msgs}\n\nLa venta no pudo ser procesada para evitar sobreventa.`
       );
       return false;
+    }
+
+    // Si falló por offline o error no relacionado a stock, encolar venta para conciliación automática en Firestore
+    if (!txResult.success) {
+      enqueueSyncOp(
+        'firestore_venta',
+        `firestore_venta:${txUid}`,
+        {
+          venta: nuevaVenta,
+          sucursalId,
+          items: consolidatedItems,
+          txUid,
+        },
+        txResult.error
+      );
     }
 
     // 3. Actualizar historial de ventas local (Offline-first inmediato)
@@ -1708,17 +1787,20 @@ export default function App() {
       {
         sucursal_id: sucursalId,
         sucursal_nombre: sucursalName,
-        detalles: `Cliente: "${cliente.nombre}" (${cliente.rif || 'S/N'}). Items: ${items.map((i) => `${i.cantidad}x ${i.producto.nombre}`).join(', ')}. Base: $${baseImponible}, IVA: $${montoIva}, Exento: $${montoExento}`,
+        detalles: `Cliente: "${cliente.nombre}" (${cliente.rif || 'S/N'}). Items: ${consolidatedItems.map((i) => `${i.cantidad}x ${i.producto.nombre}`).join(', ')}. Base: $${baseImponible}, IVA: $${montoIva}, Exento: $${montoExento}`,
       }
     );
 
-    // 5. Descontar existencias en el inventario local
+    // 5. Descontar existencias consolidadas en el inventario local
+    const qtyByProduct = new Map<number, number>(
+      consolidatedItems.map((i) => [i.producto.id, i.cantidad])
+    );
     setInventario((prevInv) => {
       const updated = prevInv.map((invItem) => {
         if (invItem.sucursal_id === sucursalId) {
-          const soldItem = items.find((i) => i.producto.id === invItem.producto_id);
-          if (soldItem) {
-            const nextStock = Math.max(0, +(invItem.stock - soldItem.cantidad).toFixed(3));
+          const soldQty = qtyByProduct.get(invItem.producto_id);
+          if (soldQty !== undefined) {
+            const nextStock = Math.max(0, +(invItem.stock - soldQty).toFixed(3));
             return {
               ...invItem,
               stock: nextStock,
@@ -2378,9 +2460,8 @@ export default function App() {
   };
 
   // Handler: Full Database & Application Reset (Factory Reset)
-  const handleResetAllData = (verifiedAdminPin?: string) => {
+  const handleResetAllData = async (verifiedAdminPin?: string) => {
     const resetIso = new Date().toISOString();
-    clearPendingSyncOps();
 
     // Snapshot General Manager + established PIN BEFORE clearing localStorage
     let storedUsersRaw: Usuario[] = [];
@@ -2400,10 +2481,18 @@ export default function App() {
         ['gerente_general', 'admin_general', 'admin'].includes((u.username || '').toLowerCase())
       );
 
-    const preservedPin =
+    let preservedPin =
       existingAdmin?.pin && existingAdmin.pin !== '••••'
         ? existingAdmin.pin
-        : '9999';
+        : '';
+    if (!preservedPin && verifiedAdminPin?.trim()) {
+      preservedPin = await hashPin(verifiedAdminPin.trim());
+    }
+    if (!preservedPin) {
+      return;
+    }
+
+    clearPendingSyncOps();
 
     // Preserve active exchange rate quote & sync flags before clearing storage
     const preservedTasa = empresaConfig.tasaCambio > 0 ? empresaConfig.tasaCambio : 0;
@@ -2549,7 +2638,7 @@ export default function App() {
 
     // Persist authenticated reset to Backend JSON DB & Cloud Firestore, then refresh live BCV quote
     void ensurePosSessionToken(cleanUsuarios[0]).then(() =>
-      fetch('/api/system/factory-reset', {
+      fetchApi('/api/system/factory-reset', {
         method: 'POST',
         headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
@@ -2722,7 +2811,7 @@ export default function App() {
       clientFactoryResetAt: localStorage.getItem(STORAGE_KEY_FACTORY_RESET_AT) || null,
     };
     void ensurePosSessionToken(currentUser).then(() =>
-      fetch('/api/sync/state', {
+      fetchApi('/api/sync/state', {
         method: 'POST',
         headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(syncRestorePayload),
@@ -2809,7 +2898,7 @@ export default function App() {
     );
 
     // Enviar inmediatamente al backend server para que la laptop y otros dispositivos lo reciban al instante
-    fetch('/api/pedidos', {
+    fetchApi('/api/pedidos', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(nuevoPedido),
@@ -2886,7 +2975,7 @@ export default function App() {
     // Sync authenticated status update with backend server (queued on failure)
     const patchBody = { estado: nuevoEstado };
     void ensurePosSessionToken(currentUser).then(() =>
-      fetch(`/api/pedidos/${encodeURIComponent(pedidoId)}`, {
+      fetchApi(`/api/pedidos/${encodeURIComponent(pedidoId)}`, {
         method: 'PATCH',
         headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(patchBody),
@@ -2988,7 +3077,7 @@ export default function App() {
 
     const billedPatchBody = { estado: 'entregado', correlativoFactura: newVentaId };
     void ensurePosSessionToken(currentUser).then(() =>
-      fetch(`/api/pedidos/${encodeURIComponent(pedido.id)}`, {
+      fetchApi(`/api/pedidos/${encodeURIComponent(pedido.id)}`, {
         method: 'PATCH',
         headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(billedPatchBody),
@@ -3061,7 +3150,8 @@ export default function App() {
         usuarios={usuarios}
         sucursales={sucursales}
         empresaConfig={empresaConfig}
-        onSelectUser={(u) => {
+        requireLogin={licenseValidation.isValid}
+        onSelectUser={async (u, verifiedPin) => {
           if (u && (!currentUser || currentUser.id !== u.id)) {
             logAuditoria(
               'Usuarios',
@@ -3073,6 +3163,7 @@ export default function App() {
               }
             );
           }
+          await ensurePosSessionToken(u, { forceRefresh: true, pin: verifiedPin });
           setCurrentUser(sanitizeUserForSession(u));
         }}
         onLoginAudit={(success, targetUser, area) => {
@@ -3102,6 +3193,7 @@ export default function App() {
               }
             );
           }
+          clearPosSessionToken();
           setCurrentUser(null);
         }}
         onOpenHtmlModal={() => setShowHtmlModal(true)}
@@ -3125,7 +3217,10 @@ export default function App() {
           currentUser={currentUser}
           empresaConfig={empresaConfig}
           onOpenRateModal={() => setShowDailyRateModal(true)}
-          onLogout={() => setCurrentUser(null)}
+          onLogout={() => {
+            clearPosSessionToken();
+            setCurrentUser(null);
+          }}
           onOpenHtmlModal={() => setShowHtmlModal(true)}
           isCollapsed={isSidebarCollapsed}
           onToggleCollapse={() => setIsSidebarCollapsed((prev) => !prev)}
@@ -3150,7 +3245,17 @@ export default function App() {
                 : 'flex-1 p-4 sm:p-6 max-w-[1680px] mx-auto w-full'
             }
           >
-            {!hasAccessToActiveTab ? (
+            {!currentUser ? (
+              <div className="bg-slate-900 border border-emerald-500/30 rounded-2xl p-8 text-center space-y-3 max-w-md mx-auto my-16">
+                <div className="w-12 h-12 rounded-2xl bg-emerald-500/15 text-emerald-400 flex items-center justify-center mx-auto border border-emerald-500/30">
+                  <Lock className="w-6 h-6" />
+                </div>
+                <h3 className="text-base font-bold text-white">Autenticación Requerida</h3>
+                <p className="text-xs text-slate-400">
+                  Selecciona tu usuario e ingresa tu PIN para acceder al sistema POS.
+                </p>
+              </div>
+            ) : !hasAccessToActiveTab ? (
               <div className="bg-slate-900 border border-amber-500/30 rounded-2xl p-8 text-center space-y-4 max-w-xl mx-auto my-12">
                 <div className="w-12 h-12 rounded-2xl bg-amber-500/20 text-amber-400 flex items-center justify-center mx-auto border border-amber-500/30">
                   <Lock className="w-6 h-6" />
@@ -3393,6 +3498,7 @@ export default function App() {
                     onOpenHtmlModal={() => setShowHtmlModal(true)}
                     onDataLoadedFromCloud={(data) => {
                       if (data.productos && data.productos.length > 0) setProductos(data.productos);
+                      if (data.inventario && data.inventario.length > 0) setInventario(data.inventario);
                       if (data.empresaConfig) applyEmpresaConfigUpdate(data.empresaConfig);
                       if (data.tiendaConfig) setTiendaConfig(data.tiendaConfig);
                     }}

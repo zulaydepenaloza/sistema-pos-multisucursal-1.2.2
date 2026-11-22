@@ -30,6 +30,7 @@ import {
   LicenseValidationResult,
   LicensePayload,
 } from '../lib/licensing';
+import { fetchApi } from '../lib/apiFetch';
 
 interface LicenseManagerViewProps {
   validationResult: LicenseValidationResult;
@@ -160,7 +161,7 @@ export const LicenseManagerView: React.FC<LicenseManagerViewProps> = ({
     };
 
     try {
-      const resp = await fetch('/api/developer/license/generate', {
+      const resp = await fetchApi('/api/developer/license/generate', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -182,11 +183,18 @@ export const LicenseManagerView: React.FC<LicenseManagerViewProps> = ({
       }
 
       if (!resp.ok) {
+        const wasRedirectedToGet =
+          resp.status === 404 &&
+          (resp.redirected ||
+            (typeof data?.error === 'string' && data.error.includes('Ruta de API no encontrada: GET ')));
+
         setActionError(
-          data?.error ||
-            (resp.status === 401 || resp.status === 403
-              ? 'Acceso denegado: Credencial de desarrollador incorrecta.'
-              : `No se pudo emitir la licencia (HTTP ${resp.status}).`)
+          wasRedirectedToGet
+            ? 'El proxy de vista previa redirigió la petición POST como GET. Abre la app en una pestaña directa o recarga la página (F5) e inténtalo de nuevo.'
+            : data?.error ||
+                (resp.status === 401 || resp.status === 403
+                  ? 'Acceso denegado: Credencial de desarrollador incorrecta (verifica ADMIN_DEV_KEY).'
+                  : `No se pudo emitir la licencia (HTTP ${resp.status}).`)
         );
         return;
       }
@@ -270,7 +278,7 @@ export const LicenseManagerView: React.FC<LicenseManagerViewProps> = ({
               rows={2}
               value={newKeyInput}
               onChange={(e) => setNewKeyInput(e.target.value)}
-              placeholder="LIC-eyJtYWNoaW5lSWQi..."
+              placeholder="ED2-eyJtYWNoaW5lSWQi..."
               className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-xs text-slate-200 font-mono focus:outline-none focus:border-indigo-500 resize-none"
             />
             <div className="flex justify-end gap-2">
@@ -358,7 +366,7 @@ export const LicenseManagerView: React.FC<LicenseManagerViewProps> = ({
               Datos de la Licencia Emitida
             </h4>
             <span className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded font-mono">
-              HMAC Firmada
+              Ed25519 / Demo
             </span>
           </div>
 

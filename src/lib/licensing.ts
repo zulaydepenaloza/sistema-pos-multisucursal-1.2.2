@@ -1,4 +1,5 @@
 import nacl from 'tweetnacl';
+import { fetchApi } from './apiFetch';
 
 export interface LicensePayload {
   machineId: string;
@@ -24,9 +25,9 @@ export interface LicenseValidationResult {
 }
 
 // Master Public Key for Ed25519 Asymmetric Verification (32 bytes)
-// The corresponding Private Signing Key is stored EXCLUSIVELY on the secure backend.
+// The corresponding Private Signing Key is stored EXCLUSIVELY in server secrets (DEV_LICENSE_ED25519_SECRET_KEY).
 // It is mathematically impossible to generate valid signatures using only this public key.
-const ED25519_PUBLIC_KEY_HEX = '7ed10863ff7693b72c2c351ce688d2c55c0dda497a32e43b4603919921475431';
+const ED25519_PUBLIC_KEY_HEX = '8d33d85875397745de69bb69e5f7376b9a464ae8cf5c7edfad66adc248b93331';
 
 const STORAGE_KEY_LICENSE = 'pos_app_crypto_license_v1';
 const STORAGE_KEY_SEED = 'pos_machine_install_seed_v1';
@@ -245,7 +246,8 @@ export function sanitizeLicenseKey(input: string): string {
 // Validate an Activation Key against the current or target Machine ID
 export function validateActivationKey(
   key: string,
-  targetMachineId?: string
+  targetMachineId?: string,
+  publicKeyHexOverride?: string
 ): LicenseValidationResult {
   const currentMachineId = (targetMachineId || getMachineFingerprint()).trim().toUpperCase();
   const cleanKey = sanitizeLicenseKey(key);
@@ -311,7 +313,7 @@ export function validateActivationKey(
       const messageStr = `${base64Payload}::${payload.machineId.trim().toUpperCase()}`;
       const messageBytes = stringToUint8Array(messageStr);
       const sigBytes = hexToUint8Array(signatureHex);
-      const pubKeyBytes = hexToUint8Array(ED25519_PUBLIC_KEY_HEX);
+      const pubKeyBytes = hexToUint8Array(publicKeyHexOverride || ED25519_PUBLIC_KEY_HEX);
 
       const isValidSignature = nacl.sign.detached.verify(messageBytes, sigBytes, pubKeyBytes);
       if (!isValidSignature) {
@@ -542,7 +544,7 @@ export async function requestTrialLicenseFromServer(
 ): Promise<{ success: boolean; key?: string; error?: string }> {
   try {
     const machineId = getMachineFingerprint();
-    const res = await fetch('/api/developer/license/trial', {
+    const res = await fetchApi('/api/developer/license/trial', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ machineId, empresa, rif }),

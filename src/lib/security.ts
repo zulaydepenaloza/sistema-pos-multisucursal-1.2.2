@@ -47,46 +47,32 @@ export function countOtherFullPrivilegeAdmins(usuarios: Usuario[], excludeUserId
 }
 
 /**
- * Guarantees that at least one user in the roster holds full 'admin' role and all 11 permissions.
- * Automatically repairs a locked-out Gerente General / Admin account if all full-admin access was lost.
+ * Ensures at least one existing administrator holds full 11-module permissions.
+ * Security hardening: NEVER promotes a non-admin user (e.g. cajero) to admin.
  */
 export function ensureMinimumFullAdmin(usuarios: Usuario[]): {
   users: Usuario[];
   repaired: boolean;
   repairedUserId?: number;
+  lockedOutNoAdmin?: boolean;
 } {
   if (!Array.isArray(usuarios) || usuarios.length === 0) {
-    return { users: [], repaired: false };
+    return { users: [], repaired: false, lockedOutNoAdmin: true };
   }
 
   if (usuarios.some((u) => isFullPrivilegeAdmin(u))) {
-    return { users: usuarios, repaired: false };
+    return { users: usuarios, repaired: false, lockedOutNoAdmin: false };
   }
 
-  const candidate =
-    usuarios.find((u) => u.rol === 'admin') ||
-    usuarios.find((u) =>
-      ['gerente_general', 'admin_general', 'admin'].includes((u.username || '').toLowerCase())
-    ) ||
-    usuarios.find(
-      (u) =>
-        (u.nombre_completo || '').toLowerCase().includes('gerente') ||
-        (u.cargo || '').toLowerCase().includes('gerente') ||
-        (u.nombre_completo || '').toLowerCase().includes('administrador') ||
-        (u.cargo || '').toLowerCase().includes('administrador')
-    ) ||
-    usuarios.find((u) => u.id === 1) ||
-    usuarios[0];
-
-  if (!candidate) {
-    return { users: usuarios, repaired: false };
+  const existingAdmin = usuarios.find((u) => u.rol === 'admin');
+  if (!existingAdmin) {
+    return { users: usuarios, repaired: false, lockedOutNoAdmin: true };
   }
 
   const repairedUsers = usuarios.map((u) =>
-    u.id === candidate.id
+    u.id === existingAdmin.id
       ? {
           ...u,
-          rol: 'admin' as const,
           sucursal_id: null,
           permisos: { ...FULL_ADMIN_PERMISSIONS },
         }
@@ -96,7 +82,8 @@ export function ensureMinimumFullAdmin(usuarios: Usuario[]): {
   return {
     users: repairedUsers,
     repaired: true,
-    repairedUserId: candidate.id,
+    repairedUserId: existingAdmin.id,
+    lockedOutNoAdmin: false,
   };
 }
 

@@ -1,39 +1,82 @@
 {
   "entities": {
+    "AdminUser": {
+      "title": "AdminUser",
+      "description": "Cuenta de usuario con privilegios administrativos de nube verificados por UID",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "UID de Firebase Auth" },
+        "email": { "type": "string", "maxLength": 200, "description": "Correo verificado del administrador" },
+        "role": { "type": "string", "enum": ["admin"], "description": "Rol administrativo" },
+        "createdAt": { "type": "string", "maxLength": 64, "description": "Marca de tiempo ISO de registro" }
+      },
+      "required": ["uid", "email", "role"]
+    },
+    "AuthorizedStaff": {
+      "title": "AuthorizedStaff",
+      "description": "Cuenta de operador POS autorizada para sincronizar con Firestore",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "UID de Firebase Auth" },
+        "email": { "type": "string", "maxLength": 200, "description": "Correo verificado del operador" },
+        "role": { "type": "string", "enum": ["admin", "supervisor", "cajero", "inventario"], "description": "Rol operativo" },
+        "activo": { "type": "boolean", "description": "Estado de habilitación" },
+        "createdAt": { "type": "string", "maxLength": 64, "description": "Marca de tiempo ISO de habilitación" }
+      },
+      "required": ["uid", "email", "role", "activo"]
+    },
     "Producto": {
       "title": "Producto",
       "description": "Producto del catálogo comercial con precios e inventario",
       "type": "object",
       "properties": {
         "id": { "type": "number", "description": "Identificador numérico único" },
-        "codigo_barras": { "type": "string", "description": "Código de barras o SKU" },
-        "nombre": { "type": "string", "description": "Nombre comercial del producto" },
-        "categoria": { "type": "string", "description": "Categoría comercial" },
+        "codigo_barras": { "type": "string", "maxLength": 100, "description": "Código de barras o SKU" },
+        "nombre": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Nombre comercial del producto" },
+        "categoria": { "type": "string", "maxLength": 120, "description": "Categoría comercial" },
+        "unidad_medida": { "type": "string", "maxLength": 40, "description": "Unidad de medida" },
+        "descripcion": { "type": "string", "maxLength": 500, "description": "Descripción del producto" },
         "precio": { "type": "number", "description": "Precio base en USD" },
         "costo": { "type": "number", "description": "Costo de adquisición en USD" },
         "stock_minimo": { "type": "number", "description": "Nivel de stock mínimo para alertas" },
         "exento_iva": { "type": "boolean", "description": "Indica si el producto está exento de IVA" },
-        "imagen": { "type": "string", "description": "URL de imagen del producto" }
+        "destacadoTienda": { "type": "boolean", "description": "Visible en catálogo de tienda online" },
+        "imagen": { "type": "string", "maxLength": 2000, "description": "URL de imagen del producto" }
       },
-      "required": ["id", "codigo_barras", "nombre", "precio"]
+      "required": ["id", "nombre", "precio"]
     },
     "PedidoOnline": {
       "title": "PedidoOnline",
       "description": "Pedido en línea generado desde la tienda virtual por un cliente",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "Identificador único del pedido web" },
-        "fecha": { "type": "string", "description": "Fecha y hora en formato ISO" },
-        "clienteNombre": { "type": "string", "description": "Nombre del cliente" },
-        "clienteTelefono": { "type": "string", "description": "Número de teléfono del cliente" },
-        "clienteCedula": { "type": "string", "description": "Cédula o RIF del cliente" },
-        "direccionEntrega": { "type": "string", "description": "Dirección para delivery o notas de retiro" },
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Identificador único del pedido web" },
+        "numeroPedido": { "type": "string", "maxLength": 50, "description": "Correlativo legible del pedido" },
+        "fecha": { "type": "string", "maxLength": 64, "description": "Fecha y hora en formato ISO" },
+        "creadoEn": { "type": "string", "maxLength": 64, "description": "Fecha de creación ISO" },
+        "clienteNombre": { "type": "string", "minLength": 1, "maxLength": 150, "description": "Nombre del cliente" },
+        "clienteTelefono": { "type": "string", "minLength": 5, "maxLength": 35, "description": "Número de teléfono del cliente" },
+        "clienteRif": { "type": "string", "maxLength": 40, "description": "Cédula o RIF del cliente" },
+        "clienteCedula": { "type": "string", "maxLength": 40, "description": "Cédula del cliente" },
+        "direccionEntrega": { "type": "string", "maxLength": 300, "description": "Dirección para delivery o notas de retiro" },
         "tipoEntrega": { "type": "string", "enum": ["delivery", "pickup", "retiro"], "description": "Modalidad de entrega" },
-        "metodoPago": { "type": "string", "description": "Método de pago seleccionado" },
+        "metodoPago": { "type": "string", "maxLength": 50, "description": "Método de pago seleccionado" },
+        "referenciaPago": { "type": "string", "maxLength": 100, "description": "Referencia de pago" },
+        "detallePago": { "type": "string", "maxLength": 250, "description": "Detalle de pago" },
+        "sucursalId": { "type": "number", "description": "Sucursal que atiende el pedido" },
+        "sucursalNombre": { "type": "string", "maxLength": 150, "description": "Nombre de la sucursal" },
+        "subtotalNeto": { "type": "number", "description": "Subtotal en USD" },
+        "baseImponible": { "type": "number", "description": "Base imponible IVA" },
+        "montoExento": { "type": "number", "description": "Monto exento" },
+        "montoIva": { "type": "number", "description": "Monto IVA" },
+        "costoDelivery": { "type": "number", "description": "Costo de envío" },
         "total": { "type": "number", "description": "Total del pedido en USD" },
         "totalBs": { "type": "number", "description": "Total del pedido en Bolívares" },
         "tasaCambio": { "type": "number", "description": "Tasa de cambio aplicada" },
-        "estado": { "type": "string", "enum": ["pendiente", "confirmado", "preparando", "despachado", "en_camino", "entregado", "cancelado"], "description": "Estado del pedido" }
+        "ventaIdGenerada": { "type": "number", "description": "ID de factura POS asociada" },
+        "notas": { "type": "string", "maxLength": 300, "description": "Notas adicionales" },
+        "detalles": { "type": "array", "description": "Renglones del pedido (máx 200)" },
+        "estado": { "type": "string", "enum": ["pendiente", "confirmado", "preparando", "despachado", "en_camino", "entregado", "cancelado", "facturado"], "description": "Estado del pedido" }
       },
       "required": ["id", "fecha", "clienteNombre", "clienteTelefono", "total", "estado"]
     },
@@ -42,17 +85,23 @@
       "description": "Configuración institucional y tasa de cambio del comercio",
       "type": "object",
       "properties": {
-        "nombreEmpresa": { "type": "string", "description": "Razón social del comercio" },
-        "rif": { "type": "string", "description": "RIF o identificación fiscal" },
-        "direccionFiscal": { "type": "string", "description": "Dirección fiscal principal" },
-        "telefono": { "type": "string", "description": "Teléfono de contacto comercial" },
+        "nombreEmpresa": { "type": "string", "maxLength": 200, "description": "Razón social del comercio" },
+        "rif": { "type": "string", "maxLength": 50, "description": "RIF o identificación fiscal" },
+        "direccionFiscal": { "type": "string", "maxLength": 300, "description": "Dirección fiscal principal" },
+        "telefono": { "type": "string", "maxLength": 100, "description": "Teléfono de contacto comercial" },
+        "logoUrl": { "type": "string", "maxLength": 2000, "description": "URL o data URI del logo" },
+        "piePaginaTicket": { "type": "string", "maxLength": 300, "description": "Pie de página de ticket térmico" },
+        "nombreTienda1": { "type": "string", "maxLength": 150, "description": "Nombre sucursal 1" },
+        "nombreTienda2": { "type": "string", "maxLength": 150, "description": "Nombre sucursal 2" },
+        "nombreOficina": { "type": "string", "maxLength": 150, "description": "Nombre oficina/almacén" },
         "tasaCambio": { "type": "number", "description": "Tasa oficial USD a Bolívares" },
-        "fechaTasa": { "type": "string", "description": "Fecha de última actualización de tasa" },
-        "factoryResetAt": { "type": "string", "description": "Marca de tiempo ISO del último reinicio de fábrica" },
-        "fiscalUpdatedAt": { "type": "string", "description": "Marca de tiempo ISO de la última actualización manual de datos fiscales" },
+        "fechaTasa": { "type": "string", "maxLength": 64, "description": "Fecha de última actualización de tasa" },
+        "ultimaActualizacionTasa": { "type": "string", "maxLength": 64, "description": "Marca de tiempo ISO de tasa" },
+        "factoryResetAt": { "type": "string", "maxLength": 64, "description": "Marca de tiempo ISO del último reinicio de fábrica" },
+        "fiscalUpdatedAt": { "type": "string", "maxLength": 64, "description": "Marca de tiempo ISO de la última actualización manual de datos fiscales" },
         "stockMinimoAlerta": { "type": "number", "description": "Umbral global de stock mínimo para alertas visuales en tiendas" }
       },
-      "required": ["tasaCambio"]
+      "required": ["nombreEmpresa", "tasaCambio"]
     },
     "Sucursal": {
       "title": "Sucursal",
@@ -60,7 +109,7 @@
       "type": "object",
       "properties": {
         "id": { "type": "number", "description": "ID numérico único de la sucursal" },
-        "nombre": { "type": "string", "description": "Nombre de la sucursal" },
+        "nombre": { "type": "string", "minLength": 1, "maxLength": 150, "description": "Nombre de la sucursal" },
         "tipo": { "type": "string", "enum": ["tienda", "oficina"], "description": "Tipo de sede" }
       },
       "required": ["id", "nombre", "tipo"]
@@ -70,13 +119,37 @@
       "description": "Ajustes de la tienda digital, métodos de pago móvil y catálogo",
       "type": "object",
       "properties": {
-        "whatsappContacto": { "type": "string", "description": "WhatsApp para recepción de pedidos" },
-        "pagoMovilBanco": { "type": "string", "description": "Banco para Pago Móvil" },
-        "pagoMovilTelefono": { "type": "string", "description": "Teléfono afiliado a Pago Móvil" },
-        "pagoMovilCedula": { "type": "string", "description": "Cédula o RIF para Pago Móvil" },
+        "habilitada": { "type": "boolean", "description": "Tienda habilitada" },
+        "nombreTienda": { "type": "string", "maxLength": 150, "description": "Nombre visible en tienda" },
+        "whatsappContacto": { "type": "string", "maxLength": 40, "description": "WhatsApp para recepción de pedidos" },
+        "mensajeBienvenida": { "type": "string", "maxLength": 300, "description": "Saludo en tienda" },
+        "bannerPromo": { "type": "string", "maxLength": 300, "description": "Banner promocional" },
+        "pagoMovilBanco": { "type": "string", "maxLength": 100, "description": "Banco para Pago Móvil" },
+        "pagoMovilTelefono": { "type": "string", "maxLength": 40, "description": "Teléfono afiliado a Pago Móvil" },
+        "pagoMovilRif": { "type": "string", "maxLength": 40, "description": "Cédula o RIF para Pago Móvil" },
+        "pagoMovilCedula": { "type": "string", "maxLength": 40, "description": "Cédula alternativa" },
+        "zelleTitular": { "type": "string", "maxLength": 120, "description": "Titular Zelle" },
+        "zelleCorreo": { "type": "string", "maxLength": 150, "description": "Correo Zelle" },
+        "horarioAtencion": { "type": "string", "maxLength": 150, "description": "Horario comercial" },
+        "permitePickup": { "type": "boolean", "description": "Permite retiro en tienda" },
+        "permiteDelivery": { "type": "boolean", "description": "Permite delivery" },
+        "costoDeliveryFijo": { "type": "number", "description": "Costo fijo de delivery" },
         "costoDeliveryBase": { "type": "number", "description": "Costo base del delivery en USD" },
-        "montoMinimoEnvioGratis": { "type": "number", "description": "Monto mínimo para delivery gratis" }
+        "deliveryGratisMinimo": { "type": "number", "description": "Monto mínimo envío gratis" },
+        "montoMinimoEnvioGratis": { "type": "number", "description": "Monto mínimo alternativo" }
       }
+    },
+    "InventarioSucursal": {
+      "title": "InventarioSucursal",
+      "description": "Documento aislado de existencias por sucursal (inventario/sucursal_{id})",
+      "type": "object",
+      "properties": {
+        "sucursalId": { "type": "number", "description": "ID de sucursal" },
+        "items": { "type": "array", "description": "Lista de artículos en stock para la sucursal" },
+        "totalArticulos": { "type": "number", "description": "Cantidad de registros de inventario" },
+        "updatedAt": { "type": "string", "maxLength": 64, "description": "Marca de tiempo ISO de actualización" }
+      },
+      "required": ["items", "sucursalId"]
     },
     "Venta": {
       "title": "Venta",
@@ -84,12 +157,24 @@
       "type": "object",
       "properties": {
         "id": { "type": "number", "description": "ID numérico de la venta" },
-        "numeroFactura": { "type": "string", "description": "Número de control fiscal o factura" },
-        "fecha": { "type": "string", "description": "Fecha de la transacción" },
-        "sucursalId": { "type": "number", "description": "ID de sucursal donde se facturó" },
-        "usuarioId": { "type": "number", "description": "ID del cajero u operador" },
+        "txUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Identificador único de idempotencia" },
+        "numeroFactura": { "type": "string", "maxLength": 100, "description": "Número de control fiscal o factura" },
+        "fecha": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Fecha de la transacción" },
+        "sucursal_id": { "type": "number", "description": "ID de sucursal donde se facturó" },
+        "usuario_id": { "type": "number", "description": "ID del cajero u operador" },
+        "usuario_nombre": { "type": "string", "maxLength": 150, "description": "Nombre del operador" },
+        "cliente_id": { "type": "number", "description": "ID del cliente" },
+        "cliente_nombre": { "type": "string", "maxLength": 150, "description": "Nombre del cliente" },
+        "cliente_rif": { "type": "string", "maxLength": 50, "description": "RIF o cédula del cliente" },
+        "subtotal_neto": { "type": "number", "description": "Subtotal neto" },
+        "base_imponible": { "type": "number", "description": "Base imponible IVA" },
+        "monto_exento": { "type": "number", "description": "Monto exento" },
+        "monto_iva": { "type": "number", "description": "Monto IVA" },
         "total": { "type": "number", "description": "Total cobrado en USD" },
-        "totalBs": { "type": "number", "description": "Total cobrado en Bolívares" }
+        "metodo_pago": { "type": "string", "maxLength": 60, "description": "Método de pago" },
+        "referencia_pago": { "type": "string", "maxLength": 100, "description": "Referencia de pago" },
+        "pago_detalle": { "type": "object", "description": "Desglose de pago" },
+        "detalles": { "type": "array", "description": "Renglones facturados" }
       },
       "required": ["id", "numeroFactura", "fecha", "total"]
     },
@@ -99,10 +184,15 @@
       "type": "object",
       "properties": {
         "id": { "type": "number", "description": "ID del usuario" },
-        "nombre_completo": { "type": "string", "description": "Nombre y apellido" },
-        "username": { "type": "string", "description": "Nombre de usuario para acceso" },
+        "nombre_completo": { "type": "string", "minLength": 1, "maxLength": 150, "description": "Nombre y apellido" },
+        "username": { "type": "string", "minLength": 1, "maxLength": 80, "description": "Nombre de usuario para acceso" },
+        "pin": { "type": "string", "maxLength": 128, "description": "Hash SHA-256 del PIN" },
         "rol": { "type": "string", "enum": ["admin", "supervisor", "cajero", "inventario"], "description": "Rol de acceso" },
-        "sucursal_id": { "type": "number", "description": "ID de sucursal asignada" }
+        "sucursal_id": { "type": "number", "description": "ID de sucursal asignada" },
+        "cargo": { "type": "string", "maxLength": 120, "description": "Cargo del usuario" },
+        "permisos": { "type": "object", "description": "Mapa de permisos por módulo" },
+        "eliminado": { "type": "boolean", "description": "Bandera de eliminación lógica" },
+        "updatedAt": { "type": "string", "maxLength": 64, "description": "Marca de tiempo ISO de actualización" }
       },
       "required": ["id", "nombre_completo", "username", "rol"]
     },
@@ -112,11 +202,15 @@
       "type": "object",
       "properties": {
         "id": { "type": "number", "description": "ID numérico del proveedor" },
-        "nombre": { "type": "string", "description": "Razón social del proveedor" },
-        "rif": { "type": "string", "description": "RIF o identificación fiscal" },
-        "telefono": { "type": "string", "description": "Teléfono de contacto" }
+        "nombre": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Razón social del proveedor" },
+        "rif": { "type": "string", "maxLength": 50, "description": "RIF o identificación fiscal" },
+        "contacto": { "type": "string", "maxLength": 120, "description": "Persona de contacto" },
+        "telefono": { "type": "string", "maxLength": 40, "description": "Teléfono de contacto" },
+        "email": { "type": "string", "maxLength": 150, "description": "Correo electrónico" },
+        "direccion": { "type": "string", "maxLength": 300, "description": "Dirección comercial" },
+        "saldoPendiente": { "type": "number", "description": "Saldo por pagar en USD" }
       },
-      "required": ["id", "nombre", "rif"]
+      "required": ["id", "nombre"]
     },
     "Compra": {
       "title": "Compra",
@@ -124,9 +218,18 @@
       "type": "object",
       "properties": {
         "id": { "type": "number", "description": "ID de la compra" },
-        "numeroFactura": { "type": "string", "description": "Número de factura emitida por proveedor" },
+        "numeroFactura": { "type": "string", "maxLength": 100, "description": "Número de factura emitida por proveedor" },
         "proveedorId": { "type": "number", "description": "ID del proveedor" },
-        "fecha": { "type": "string", "description": "Fecha de emisión" },
+        "proveedorNombre": { "type": "string", "maxLength": 200, "description": "Nombre del proveedor" },
+        "sucursalId": { "type": "number", "description": "Sucursal receptora" },
+        "fecha": { "type": "string", "maxLength": 64, "description": "Fecha de emisión" },
+        "fechaVencimiento": { "type": "string", "maxLength": 64, "description": "Fecha de vencimiento" },
+        "condicionPago": { "type": "string", "enum": ["contado", "credito"], "description": "Condición de pago" },
+        "estado": { "type": "string", "maxLength": 40, "description": "Estado de la compra" },
+        "usuarioNombre": { "type": "string", "maxLength": 150, "description": "Operador" },
+        "tasaRecepcion": { "type": "number", "description": "Tasa al recibir" },
+        "pagarATasaRecepcion": { "type": "boolean", "description": "Pagar a tasa fija de recepción" },
+        "detalles": { "type": "array", "description": "Renglones comprados" },
         "total": { "type": "number", "description": "Total de la compra en USD" }
       },
       "required": ["id", "numeroFactura", "fecha", "total"]
@@ -137,8 +240,22 @@
       "type": "object",
       "properties": {
         "id": { "type": "number", "description": "ID de la cuenta" },
+        "clienteId": { "type": "number", "description": "ID cliente" },
+        "clienteNombre": { "type": "string", "maxLength": 200, "description": "Nombre cliente" },
+        "proveedorId": { "type": "number", "description": "ID proveedor" },
+        "proveedorNombre": { "type": "string", "maxLength": 200, "description": "Nombre proveedor" },
+        "facturaNumero": { "type": "string", "maxLength": 100, "description": "Número de factura" },
+        "concepto": { "type": "string", "maxLength": 250, "description": "Concepto de cuenta" },
+        "fechaEmision": { "type": "string", "maxLength": 64, "description": "Fecha emisión" },
+        "fechaVencimiento": { "type": "string", "maxLength": 64, "description": "Fecha vencimiento" },
         "montoTotal": { "type": "number", "description": "Monto total adeudado" },
         "montoPagado": { "type": "number", "description": "Monto cancelado" },
+        "saldoRestante": { "type": "number", "description": "Saldo pendiente" },
+        "abonos": { "type": "array", "description": "Historial de abonos" },
+        "pagos": { "type": "array", "description": "Historial de pagos" },
+        "tasaRecepcion": { "type": "number", "description": "Tasa histórica" },
+        "pagarATasaRecepcion": { "type": "boolean", "description": "Tasa fija" },
+        "updatedAt": { "type": "string", "maxLength": 64, "description": "Última actualización" },
         "estado": { "type": "string", "enum": ["pendiente", "parcial", "pagada", "vencida"], "description": "Estado de la cuenta" }
       },
       "required": ["id", "montoTotal", "estado"]
@@ -148,23 +265,41 @@
       "description": "Bitácora inmutable de auditoría para trazabilidad de operaciones",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "ID único del evento de auditoría" },
-        "accion": { "type": "string", "description": "Acción realizada" },
-        "modulo": { "type": "string", "description": "Módulo donde ocurrió la acción" },
-        "usuario": { "type": "string", "description": "Usuario responsable" },
-        "timestamp": { "type": "string", "description": "Marca de tiempo del evento" }
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "ID único del evento de auditoría" },
+        "accion": { "type": "string", "maxLength": 250, "description": "Acción realizada" },
+        "tipo_accion": { "type": "string", "maxLength": 100, "description": "Tipo de acción" },
+        "modulo": { "type": "string", "maxLength": 120, "description": "Módulo donde ocurrió la acción" },
+        "descripcion": { "type": "string", "maxLength": 500, "description": "Descripción" },
+        "detalles": { "type": "string", "maxLength": 1000, "description": "Detalles adicionales" },
+        "usuario": { "type": "string", "maxLength": 150, "description": "Usuario responsable" },
+        "usuario_id": { "type": "number", "description": "ID numérico de usuario" },
+        "usuario_username": { "type": "string", "maxLength": 80, "description": "Username" },
+        "usuario_rol": { "type": "string", "maxLength": 40, "description": "Rol del operador" },
+        "sucursal_id": { "type": "number", "description": "Sucursal" },
+        "sucursal_nombre": { "type": "string", "maxLength": 150, "description": "Nombre sucursal" },
+        "fecha": { "type": "string", "maxLength": 40, "description": "Fecha legible" },
+        "hora": { "type": "string", "maxLength": 40, "description": "Hora legible" },
+        "timestamp": { "type": "string", "maxLength": 64, "description": "Marca de tiempo del evento" }
       },
       "required": ["id", "accion", "timestamp"]
     }
   },
   "firestore": {
+    "/admins/{uid}": {
+      "schema": "AdminUser",
+      "description": "Administradores autorizados en Firebase Auth"
+    },
+    "/authorized_staff/{uid}": {
+      "schema": "AuthorizedStaff",
+      "description": "Personal operativo autorizado en Firebase Auth"
+    },
     "/productos/{productoId}": {
       "schema": "Producto",
       "description": "Colección de productos del catálogo de la tienda y POS"
     },
     "/pedidos_online/{pedidoId}": {
       "schema": "PedidoOnline",
-      "description": "Pedidos en línea generados por los clientes en tiempo real"
+      "description": "Pedidos en línea generados por los clientes"
     },
     "/empresa_config/{configId}": {
       "schema": "EmpresaConfig",
@@ -172,15 +307,15 @@
     },
     "/tienda_config/{configId}": {
       "schema": "TiendaConfig",
-      "description": "Configuración de la tienda online (pago móvil, delivery, etc.)"
+      "description": "Configuración de la tienda online"
     },
     "/ventas/{ventaId}": {
       "schema": "Venta",
       "description": "Historial de facturas y ventas realizadas en el POS"
     },
     "/inventario/{docId}": {
-      "schema": "Producto",
-      "description": "Existencias de inventario por sucursal"
+      "schema": "InventarioSucursal",
+      "description": "Existencias aisladas por sucursal (sucursal_{id})"
     },
     "/sucursales/{sucursalId}": {
       "schema": "Sucursal",
@@ -188,7 +323,7 @@
     },
     "/usuarios/{usuarioId}": {
       "schema": "Usuario",
-      "description": "Operadores y credenciales de acceso del sistema"
+      "description": "Operadores y hashes SHA-256 de acceso del sistema"
     },
     "/proveedores/{proveedorId}": {
       "schema": "Proveedor",

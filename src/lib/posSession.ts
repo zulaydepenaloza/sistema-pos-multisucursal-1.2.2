@@ -1,5 +1,6 @@
 import { Usuario } from '../types';
 import { getMachineFingerprint } from './licensing';
+import { fetchApi } from './apiFetch';
 
 const SESSION_TOKEN_KEY = 'pos_api_session_token_v1';
 const SESSION_META_KEY = 'pos_api_session_meta_v1';
@@ -67,7 +68,7 @@ export async function ensurePosSessionToken(
 
   const run = async (): Promise<string | null> => {
     try {
-      const resp = await fetch('/api/auth/pos-session', {
+      const resp = await fetchApi('/api/auth/pos-session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

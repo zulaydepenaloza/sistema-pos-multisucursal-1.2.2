@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type http from 'node:http';
+import nacl from 'tweetnacl';
 
 // Polyfill browser localStorage cleanly before importing frontend modules in Node
 const memStorage = new Map<string, string>();
@@ -42,12 +43,14 @@ import {
   getPendingSyncOps,
   clearPendingSyncOps,
 } from '../src/lib/syncQueue';
+import { consolidateSaleItems } from '../src/lib/firebaseClient';
+import { fetchApi } from '../src/lib/apiFetch';
 import {
   findMatchingProveedor,
   deduplicateProveedoresList,
   validateVenezuelanFiscalId,
 } from '../src/lib/validations';
-import { Usuario } from '../src/types';
+import { Producto, Usuario } from '../src/types';
 
 // Ensure importing server.ts does not attempt to bind port 3000 during tests
 process.env.SKIP_SERVER_LISTEN = '1';
@@ -90,29 +93,48 @@ describe('Seguridad de PINs, Sesiones y Control de Privilegios', () => {
     assert.equal(storedTwice[0].pin, stored[0].pin);
   });
 
-  test('ensureMinimumFullAdmin repara automáticamente si no queda ningún administrador con los 11 permisos', () => {
-    const users: Usuario[] = [
+  test('ensureMinimumFullAdmin repara permisos de un admin existente y NUNCA promueve un cajero a admin', () => {
+    const existingAdminWithPartialPerms: Usuario[] = [
       {
         id: 1,
         username: 'gerente_general',
         nombre_completo: 'Gerente General',
         pin: 'abcd'.repeat(16),
-        rol: 'cajero',
+        rol: 'admin',
         sucursal_id: 1,
-        cargo: 'Operador',
+        cargo: 'Gerente General',
         permisos: { ...FULL_ADMIN_PERMISSIONS, configuracion: false },
       },
     ];
 
-    const res = ensureMinimumFullAdmin(users);
-    assert.equal(res.repaired, true);
-    assert.equal(res.users[0].rol, 'admin');
-    assert.equal(res.users[0].permisos?.configuracion, true);
+    const resAdmin = ensureMinimumFullAdmin(existingAdminWithPartialPerms);
+    assert.equal(resAdmin.repaired, true);
+    assert.equal(resAdmin.lockedOutNoAdmin, false);
+    assert.equal(resAdmin.users[0].rol, 'admin');
+    assert.equal(resAdmin.users[0].permisos?.configuracion, true);
+
+    const onlyCashiers: Usuario[] = [
+      {
+        id: 2,
+        username: 'cajero_1',
+        nombre_completo: 'Cajero Caja 1',
+        pin: 'ef01'.repeat(16),
+        rol: 'cajero',
+        sucursal_id: 1,
+        cargo: 'Cajero',
+        permisos: { ...FULL_ADMIN_PERMISSIONS, configuracion: false },
+      },
+    ];
+
+    const resCashier = ensureMinimumFullAdmin(onlyCashiers);
+    assert.equal(resCashier.repaired, false);
+    assert.equal(resCashier.lockedOutNoAdmin, true);
+    assert.equal(resCashier.users[0].rol, 'cajero');
   });
 });
 
 describe('Licenciamiento Asimétrico Ed25519 y Bloqueo de Emisión Offline', () => {
-  test('generateOfflineAuthorizedLicense rechaza la emisión comercial offline aunque pasen clave maestra', () => {
+  test('generateOfflineAuthorizedLicense rechaza la emisión comercial offline aunque se pase cualquier clave', () => {
     const res = generateOfflineAuthorizedLicense(
       {
         machineId: 'POS-TEST-0000-0000-0000',
@@ -124,13 +146,13 @@ describe('Licenciamiento Asimétrico Ed25519 y Bloqueo de Emisión Offline', () 
         cajasMax: 5,
         sucursalesMax: 3,
       },
-      'OmniPosDev2026MasterKey'
+      'TestSecretOnlyForUnitCheck'
     );
     assert.equal(res.success, false);
     assert.equal(res.key, undefined);
   });
 
-  test('createTrialLicenseForCurrentMachine genera clave DEMO- válida y rechaza alteración de fechas o formato LIC-', () => {
+  test('createTrialLicenseForCurrentMachine genera clave DEMO- válida y rechaza alteración o formato LIC-', () => {
     const machineId = getMachineFingerprint();
     const demoKey = createTrialLicenseForCurrentMachine('Negocio Demo', 'J-00000000-0');
     assert.ok(demoKey.startsWith('DEMO-'));
@@ -151,8 +173,8 @@ describe('Licenciamiento Asimétrico Ed25519 y Bloqueo de Emisión Offline', () 
   });
 });
 
-describe('Respaldos JSON, Cola Offline Idempotente y Deduplicación de Proveedores', () => {
-  test('validateAndParseBackupJson preserva stock_minimo individual y rechaza JSON corrupto', () => {
+describe('Respaldos JSON, Consolidación de Ítems, Cola Offline Idempotente y Proveedores', () => {
+  test('validateAndParseBackupJson preserva stock_minimo, reporta warnings/rejectedStats y rechaza JSON corrupto', () => {
     const bad = validateAndParseBackupJson('{invalid');
     assert.equal(bad.isValid, false);
 
@@ -165,8 +187,14 @@ describe('Respaldos JSON, Cola Offline Idempotente y Deduplicación de Proveedor
           { id: 1, nombre: 'Harina Maíz', precio: 1.5, stock_minimo: 12 },
           { id: 2, nombre: 'Producto Inválido', precio: -5 },
         ],
-        inventario: [{ producto_id: 1, sucursal_id: 1, stock: 30 }],
-        ventas: [],
+        inventario: [
+          { producto_id: 1, sucursal_id: 1, stock: 30 },
+          { producto_id: 'bad', sucursal_id: 1, stock: 5 },
+        ],
+        ventas: [
+          { id: 1001, total: 25.5 },
+          { id: 1002, total: -10 },
+        ],
         usuarios: [],
       },
     });
@@ -176,20 +204,60 @@ describe('Respaldos JSON, Cola Offline Idempotente y Deduplicación de Proveedor
     assert.equal(parsed.payload?.datos.productos.length, 1);
     assert.equal(parsed.payload?.datos.productos[0].stock_minimo, 12);
     assert.equal(parsed.payload?.datos.inventario.length, 1);
+    assert.equal(parsed.payload?.datos.inventario[0].id, 1);
+    assert.equal(parsed.rejectedStats?.productos, 1);
+    assert.equal(parsed.rejectedStats?.inventario, 1);
+    assert.equal(parsed.rejectedStats?.ventas, 1);
+    assert.ok(Array.isArray(parsed.warnings) && parsed.warnings.length >= 3);
   });
 
-  test('syncQueue encola idempotente por dedupeKey y reintenta manteniendo fallidos', async () => {
+  test('consolidateSaleItems fusiona líneas duplicadas del mismo producto para validación atómica de stock', () => {
+    const prodA: Producto = {
+      id: 10,
+      codigo_barras: '7591234',
+      nombre: 'Queso Blanco',
+      precio: 6.5,
+      unidad_medida: 'KG',
+    };
+    const prodB: Producto = {
+      id: 20,
+      codigo_barras: '7595678',
+      nombre: 'Refresco 2L',
+      precio: 2.2,
+      unidad_medida: 'UND',
+    };
+
+    const consolidated = consolidateSaleItems([
+      { producto: prodA, cantidad: 0.75 },
+      { producto: prodB, cantidad: 2 },
+      { producto: prodA, cantidad: 0.5 },
+    ]);
+
+    assert.equal(consolidated.length, 2);
+    const mergedA = consolidated.find((c) => c.producto.id === 10);
+    const mergedB = consolidated.find((c) => c.producto.id === 20);
+    assert.equal(mergedA?.cantidad, 1.25);
+    assert.equal(mergedB?.cantidad, 2);
+  });
+
+  test('syncQueue encola idempotente por dedupeKey (incluyendo firestore_venta) y reintenta manteniendo fallidos', async () => {
     clearPendingSyncOps();
     enqueueSyncOp('sync_state', 'sync_state:latest', { step: 1 });
     enqueueSyncOp('sync_state', 'sync_state:latest', { step: 2 });
-    enqueueSyncOp('pedido_create', 'pedido_create:ped_99', { id: 'ped_99' });
+    enqueueSyncOp('firestore_venta', 'firestore_venta:vta_1_tx123', {
+      txUid: 'tx123',
+      sucursalId: 1,
+      venta: { id: 1, total: 15 },
+      items: [],
+    });
 
     const opsBefore = getPendingSyncOps();
     assert.equal(opsBefore.length, 2);
     assert.equal(opsBefore[0].payload.step, 2);
+    assert.equal(opsBefore[1].type, 'firestore_venta');
 
     const firstFlush = await flushSyncQueue(async (op) => {
-      return op.type === 'pedido_create'; // sync_state fails once, pedido_create succeeds
+      return op.type === 'firestore_venta'; // sync_state fails once, firestore_venta succeeds
     });
     assert.equal(firstFlush.succeeded, 1);
     assert.equal(firstFlush.remaining, 1);
@@ -238,13 +306,20 @@ describe('Respaldos JSON, Cola Offline Idempotente y Deduplicación de Proveedor
   });
 });
 
-describe('Seguridad Backend HTTP, CORS, Autorización y Licenciamiento Ed25519', () => {
+describe('Seguridad Backend HTTP, Fail-Closed Secrets, Autorización y Licenciamiento Ed25519', () => {
   let server: http.Server;
   let baseUrl = '';
   const dbPath = path.join(process.cwd(), 'data', 'server_db.json');
   let originalDbContent: string | null = null;
+  let origAdminDevKey: string | undefined;
+  let origLicenseSecretKey: string | undefined;
 
   before(async () => {
+    origAdminDevKey = process.env.ADMIN_DEV_KEY;
+    origLicenseSecretKey = process.env.DEV_LICENSE_ED25519_SECRET_KEY;
+    delete process.env.ADMIN_DEV_KEY;
+    delete process.env.DEV_LICENSE_ED25519_SECRET_KEY;
+
     if (fs.existsSync(dbPath)) {
       originalDbContent = fs.readFileSync(dbPath, 'utf-8');
       fs.unlinkSync(dbPath);
@@ -260,6 +335,17 @@ describe('Seguridad Backend HTTP, CORS, Autorización y Licenciamiento Ed25519',
   });
 
   after(async () => {
+    if (origAdminDevKey !== undefined) {
+      process.env.ADMIN_DEV_KEY = origAdminDevKey;
+    } else {
+      delete process.env.ADMIN_DEV_KEY;
+    }
+    if (origLicenseSecretKey !== undefined) {
+      process.env.DEV_LICENSE_ED25519_SECRET_KEY = origLicenseSecretKey;
+    } else {
+      delete process.env.DEV_LICENSE_ED25519_SECRET_KEY;
+    }
+
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (originalDbContent !== null) {
       fs.writeFileSync(dbPath, originalDbContent, 'utf-8');
@@ -282,7 +368,13 @@ describe('Seguridad Backend HTTP, CORS, Autorización y Licenciamiento Ed25519',
     assert.equal(allowed.headers.get('vary'), 'Origin');
   });
 
-  test('Exige sesión autenticada y roles en endpoints operativos y bloquea /api/download-zip por query string', async () => {
+  test('Bloquea rutas internas sin sesión (GET /api/pedidos, GET /api/sync/state) y expone catálogo sanitizado en /api/public/store-state', async () => {
+    const unauthPedidos = await fetch(`${baseUrl}/api/pedidos`);
+    assert.equal(unauthPedidos.status, 401);
+
+    const unauthSyncGet = await fetch(`${baseUrl}/api/sync/state`);
+    assert.equal(unauthSyncGet.status, 401);
+
     const unauthPatch = await fetch(`${baseUrl}/api/pedidos/ped_test`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -303,11 +395,6 @@ describe('Seguridad Backend HTTP, CORS, Autorización y Licenciamiento Ed25519',
       body: JSON.stringify({ confirmWord: 'REINICIAR' }),
     });
     assert.equal(unauthReset.status, 401);
-
-    const queryTokenZip = await fetch(
-      `${baseUrl}/api/download-zip?token=OmniPosDev2026MasterKey`
-    );
-    assert.equal(queryTokenZip.status, 403);
 
     // Obtain a cajero POS session token and verify role enforcement
     const cashierSessionRes = await fetch(`${baseUrl}/api/auth/pos-session`, {
@@ -339,51 +426,118 @@ describe('Seguridad Backend HTTP, CORS, Autorización y Licenciamiento Ed25519',
       body: JSON.stringify({ fileBase64: 'ZmFrZQ==', mimeType: 'image/png' }),
     });
     assert.equal(forbiddenInvoice.status, 403);
+
+    // Public storefront endpoint works without auth and stays sanitized
+    const publicStoreRes = await fetch(`${baseUrl}/api/public/store-state`);
+    assert.equal(publicStoreRes.status, 200);
+    const publicStoreJson = (await publicStoreRes.json()) as any;
+    assert.equal(publicStoreJson.success, true);
+    assert.equal(publicStoreJson.pedidos, undefined);
   });
 
-  test('Valida PIN hash de administrador en factory-reset y sanitiza campos sensibles en /api/sync/state', async () => {
-    const adminSessionRes = await fetch(`${baseUrl}/api/auth/pos-session`, {
+  test('Valida PINs registrados en /api/auth/pos-session, protege /api/sync/state y sanitiza datos públicos y privados', async () => {
+    // First admin bootstrap sync before hashes are registered
+    const initAdminRes = await fetch(`${baseUrl}/api/auth/pos-session`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ userId: 1, rol: 'admin', machineId: 'POS-ADMIN-0001' }),
     });
-    const adminSession = (await adminSessionRes.json()) as { token: string };
+    assert.equal(initAdminRes.status, 200);
+    const initAdminSession = (await initAdminRes.json()) as { token: string };
+
     const realAdminPinHash = await hashPin('4917');
+    const realCashierPinHash = await hashPin('2580');
 
     const syncRes = await fetch(`${baseUrl}/api/sync/state`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-pos-session': adminSession.token,
+        'x-pos-session': initAdminSession.token,
       },
       body: JSON.stringify({
         empresaConfig: {
           nombreEmpresa: 'Empresa Test Seguro',
+          rif: 'J-99999999-1',
+          direccionFiscal: 'Av. Privada 123',
+          telefono: '0212-5550000',
           tasaCambio: 50,
           fiscalUpdatedAt: new Date().toISOString(),
           apiKey: 'SHOULD_BE_STRIPPED',
           pin: 'SHOULD_BE_STRIPPED',
         },
+        productos: [
+          {
+            id: 1,
+            nombre: 'Café Molido 500g',
+            precio: 5.5,
+            costo: 3.1,
+            codigo_barras: '7590001',
+          },
+        ],
+        inventario: [{ id: 1, producto_id: 1, sucursal_id: 1, stock: 42 }],
         adminPinHashes: [{ id: 1, pinHash: realAdminPinHash }],
+        userPinHashes: [
+          { id: 1, pinHash: realAdminPinHash },
+          { id: 2, pinHash: realCashierPinHash },
+        ],
       }),
     });
     assert.equal(syncRes.status, 200);
-    const syncJson = (await syncRes.json()) as { success: boolean };
-    assert.equal(syncJson.success, true);
 
-    const getStateRes = await fetch(`${baseUrl}/api/sync/state`);
+    // Public store-state MUST omit RIF, dirección, teléfono, pedidos, costo and expose `stock`
+    const publicRes = await fetch(`${baseUrl}/api/public/store-state`);
+    assert.equal(publicRes.status, 200);
+    const publicJson = (await publicRes.json()) as any;
+    assert.equal(publicJson.empresaConfig.nombreEmpresa, 'Empresa Test Seguro');
+    assert.equal(publicJson.empresaConfig.rif, undefined);
+    assert.equal(publicJson.empresaConfig.direccionFiscal, undefined);
+    assert.equal(publicJson.empresaConfig.telefono, undefined);
+    assert.equal(publicJson.productos[0].costo, undefined);
+    assert.equal(publicJson.inventario[0].stock, 42);
+    assert.equal(publicJson.pedidos, undefined);
+
+    // Now that userPinHashes are synced, POS session MUST reject missing or wrong PIN with 401
+    const missingPinSession = await fetch(`${baseUrl}/api/auth/pos-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: 2, rol: 'cajero', machineId: 'POS-CAJA-2' }),
+    });
+    assert.equal(missingPinSession.status, 401);
+
+    const wrongPinSession = await fetch(`${baseUrl}/api/auth/pos-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: 1, rol: 'admin', machineId: 'POS-ADMIN-0001', pin: '9999' }),
+    });
+    assert.equal(wrongPinSession.status, 401);
+
+    // Correct PIN succeeds
+    const validAdminSessionRes = await fetch(`${baseUrl}/api/auth/pos-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: 1, rol: 'admin', machineId: 'POS-ADMIN-0001', pin: '4917' }),
+    });
+    assert.equal(validAdminSessionRes.status, 200);
+    const validAdminSession = (await validAdminSessionRes.json()) as { token: string };
+
+    // Authenticated GET /api/sync/state succeeds and omits sensitive keys/PIN hashes
+    const getStateRes = await fetch(`${baseUrl}/api/sync/state`, {
+      headers: { 'x-pos-session': validAdminSession.token },
+    });
+    assert.equal(getStateRes.status, 200);
     const getStateJson = (await getStateRes.json()) as any;
     assert.equal(getStateJson.empresaConfig.nombreEmpresa, 'Empresa Test Seguro');
     assert.equal(getStateJson.empresaConfig.apiKey, undefined);
     assert.equal(getStateJson.empresaConfig.pin, undefined);
     assert.equal(getStateJson.adminPinHashes, undefined);
+    assert.equal(getStateJson.userPinHashes, undefined);
 
-    // Wrong PIN must be rejected with 403 even with valid admin session token
+    // Wrong PIN must be rejected with 403 on factory-reset even with valid admin session token
     const badPinReset = await fetch(`${baseUrl}/api/system/factory-reset`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-pos-session': adminSession.token,
+        'x-pos-session': validAdminSession.token,
       },
       body: JSON.stringify({
         confirmWord: 'REINICIAR',
@@ -392,12 +546,12 @@ describe('Seguridad Backend HTTP, CORS, Autorización y Licenciamiento Ed25519',
     });
     assert.equal(badPinReset.status, 403);
 
-    // Genuine admin PIN succeeds cleanly
+    // Genuine admin PIN succeeds cleanly and preserves PIN hashes
     const okPinReset = await fetch(`${baseUrl}/api/system/factory-reset`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-pos-session': adminSession.token,
+        'x-pos-session': validAdminSession.token,
       },
       body: JSON.stringify({
         confirmWord: 'REINICIAR',
@@ -405,57 +559,151 @@ describe('Seguridad Backend HTTP, CORS, Autorización y Licenciamiento Ed25519',
       }),
     });
     assert.equal(okPinReset.status, 200);
+
+    // After factory-reset, wrong PIN is still rejected because adminPinHashes/userPinHashes were preserved
+    const postResetBadPin = await fetch(`${baseUrl}/api/auth/pos-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: 1, rol: 'admin', machineId: 'POS-ADMIN-0001', pin: '9999' }),
+    });
+    assert.equal(postResetBadPin.status, 401);
   });
 
-  test('Emite licencia Ed25519 válida con token de desarrollador correcto y rechaza token inválido; tienda pública conserva creación de pedidos', async () => {
+  test('Falla cerrado (503) sin secretos configurados, y emite licencia Ed25519 válida con secretos de prueba efímeros', async () => {
     const machineId = 'POS-1234-5678-ABCD-EF01';
-    const badLicRes = await fetch(`${baseUrl}/api/developer/license/generate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-admin-token': 'CLAVE_INCORRECTA',
-      },
-      body: JSON.stringify({ machineId, empresa: 'Mi Empresa', devSecret: 'CLAVE_INCORRECTA' }),
-    });
-    assert.equal(badLicRes.status, 403);
 
-    const validSecret = process.env.ADMIN_DEV_KEY || 'OmniPosDev2026MasterKey';
-    const okLicRes = await fetch(`${baseUrl}/api/developer/license/generate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-admin-token': validSecret,
-      },
-      body: JSON.stringify({ machineId, empresa: 'Mi Empresa', devSecret: validSecret }),
-    });
-    assert.equal(okLicRes.status, 200);
-    const licJson = (await okLicRes.json()) as { success: boolean; key: string };
-    assert.equal(licJson.success, true);
-    assert.ok(licJson.key.startsWith('ED2-'));
-
-    const verified = validateActivationKey(licJson.key, machineId);
-    assert.equal(verified.isValid, true);
-    assert.equal(verified.algorithm, 'Ed25519 Asymmetric');
-
-    // Public storefront order validation & creation
-    const badOrder = await fetch(`${baseUrl}/api/pedidos`, {
+    // Without ADMIN_DEV_KEY & DEV_LICENSE_ED25519_SECRET_KEY, developer endpoints must fail closed with 503
+    const unconfiguredVerify = await fetch(`${baseUrl}/api/developer/verify-token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ clienteNombre: 'A', detalles: [] }),
+      body: JSON.stringify({ token: 'any' }),
     });
-    assert.equal(badOrder.status, 400);
+    assert.equal(unconfiguredVerify.status, 503);
 
-    const okOrder = await fetch(`${baseUrl}/api/pedidos`, {
+    const unconfiguredLicense = await fetch(`${baseUrl}/api/developer/license/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: 'ped_test_http_1',
-        clienteNombre: 'María Cliente',
-        clienteTelefono: '0414-0001122',
-        detalles: [{ productoId: 1, cantidad: 2, precioUnitario: 5 }],
-        total: 10,
-      }),
+      body: JSON.stringify({ machineId, empresa: 'Mi Empresa' }),
     });
-    assert.equal(okOrder.status, 200);
+    assert.equal(unconfiguredLicense.status, 503);
+
+    const unconfiguredZip = await fetch(`${baseUrl}/api/download-zip`, {
+      headers: { 'x-admin-token': 'any' },
+    });
+    assert.equal(unconfiguredZip.status, 503);
+
+    // Configure ephemeral test-only secrets cleanly for signing verification
+    const ephemeralPair = nacl.sign.keyPair();
+    const ephemeralSecretHex = Buffer.from(ephemeralPair.secretKey).toString('hex');
+    const ephemeralPublicHex = Buffer.from(ephemeralPair.publicKey).toString('hex');
+    const ephemeralDevToken = 'EPHEMERAL_TEST_DEV_TOKEN_2026';
+
+    process.env.ADMIN_DEV_KEY = ephemeralDevToken;
+    process.env.DEV_LICENSE_ED25519_SECRET_KEY = ephemeralSecretHex;
+
+    try {
+      const badLicRes = await fetch(`${baseUrl}/api/developer/license/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-token': 'CLAVE_INCORRECTA',
+        },
+        body: JSON.stringify({ machineId, empresa: 'Mi Empresa', devSecret: 'CLAVE_INCORRECTA' }),
+      });
+      assert.equal(badLicRes.status, 403);
+
+      const okLicRes = await fetch(`${baseUrl}/api/developer/license/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-token': ephemeralDevToken,
+        },
+        body: JSON.stringify({ machineId, empresa: 'Mi Empresa', devSecret: ephemeralDevToken }),
+      });
+      assert.equal(okLicRes.status, 200);
+      const licJson = (await okLicRes.json()) as { success: boolean; key: string };
+      assert.equal(licJson.success, true);
+      assert.ok(licJson.key.startsWith('ED2-'));
+
+      const verified = validateActivationKey(licJson.key, machineId, ephemeralPublicHex);
+      assert.equal(verified.isValid, true);
+      assert.equal(verified.algorithm, 'Ed25519 Asymmetric');
+
+      // Trial endpoint also issues valid ED2- key signed with configured Ed25519 secret
+      const trialRes = await fetch(`${baseUrl}/api/developer/license/trial`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ machineId, empresa: 'Tienda Demo' }),
+      });
+      assert.equal(trialRes.status, 200);
+      const trialJson = (await trialRes.json()) as { success: boolean; key: string };
+      assert.ok(trialJson.key.startsWith('ED2-'));
+      const trialVerified = validateActivationKey(trialJson.key, machineId, ephemeralPublicHex);
+      assert.equal(trialVerified.isValid, true);
+      assert.equal(trialVerified.license?.tipo, 'demo');
+
+      // Public storefront order validation & creation remains active
+      const badOrder = await fetch(`${baseUrl}/api/pedidos`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clienteNombre: 'A', detalles: [] }),
+      });
+      assert.equal(badOrder.status, 400);
+
+      const okOrder = await fetch(`${baseUrl}/api/pedidos`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: 'ped_test_http_1',
+          clienteNombre: 'María Cliente',
+          clienteTelefono: '0414-0001122',
+          detalles: [{ productoId: 1, cantidad: 2, precioUnitario: 5 }],
+          total: 10,
+        }),
+      });
+      assert.equal(okOrder.status, 200);
+    } finally {
+      delete process.env.ADMIN_DEV_KEY;
+      delete process.env.DEV_LICENSE_ED25519_SECRET_KEY;
+    }
+  });
+
+  test('fetchApi recupera automáticamente peticiones POST cuando un proxy redirige el primer intento como GET (404)', async () => {
+    const originalFetch = globalThis.fetch;
+    let callCount = 0;
+
+    (globalThis as any).fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+      callCount++;
+      assert.equal(init?.credentials, 'same-origin');
+      assert.equal(init?.method, 'POST');
+      if (callCount === 1) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: 'Ruta de API no encontrada: GET /api/developer/license/generate',
+          }),
+          {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          }
+        );
+      }
+      return new Response(JSON.stringify({ success: true, key: 'ED2-OK' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    try {
+      const res = await fetchApi('/api/developer/license/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ test: true }),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(callCount, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

@@ -1,6 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { Database, CheckCircle, AlertCircle, RefreshCw, Cloud, CloudCheck, Flame, ShieldCheck, ArrowUpRight, ArrowDownRight, Layers } from 'lucide-react';
-import { testFirestoreConnection, syncAllToFirestore, fetchAllFromFirestore, firebaseConfig } from '../lib/firebaseClient';
+import {
+  testFirestoreConnection,
+  syncAllToFirestore,
+  fetchAllFromFirestore,
+  firebaseConfig,
+  subscribeToCloudAuth,
+  signInWithGoogleCloud,
+  signOutGoogleCloud,
+  CloudAuthUser,
+} from '../lib/firebaseClient';
 import { Producto, EmpresaConfig, TiendaConfig, Sucursal, InventarioItem } from '../types';
 
 interface FirebaseSyncSettingsProps {
@@ -10,7 +19,12 @@ interface FirebaseSyncSettingsProps {
   sucursales: Sucursal[];
   inventario: InventarioItem[];
   onRefreshData?: () => void;
-  onDataLoadedFromCloud?: (data: { productos?: Producto[]; empresaConfig?: EmpresaConfig; tiendaConfig?: TiendaConfig }) => void;
+  onDataLoadedFromCloud?: (data: {
+    productos?: Producto[];
+    inventario?: InventarioItem[];
+    empresaConfig?: EmpresaConfig;
+    tiendaConfig?: TiendaConfig;
+  }) => void;
 }
 
 export const FirebaseSyncSettings: React.FC<FirebaseSyncSettingsProps> = ({
@@ -28,15 +42,43 @@ export const FirebaseSyncSettings: React.FC<FirebaseSyncSettingsProps> = ({
   const [isSyncing, setIsSyncing] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [isConnected, setIsConnected] = useState<boolean | null>(null);
+  const [cloudUser, setCloudUser] = useState<CloudAuthUser | null>(null);
+  const [isSigningInCloud, setIsSigningInCloud] = useState(false);
 
   useEffect(() => {
-    // Initial silent ping to verify connectivity
-    testFirestoreConnection().then((res) => {
-      setIsConnected(res.success);
-    }).catch(() => {
-      setIsConnected(false);
+    const unsub = subscribeToCloudAuth((user) => {
+      setCloudUser(user);
+      if (user?.emailVerified) {
+        testFirestoreConnection()
+          .then((res) => setIsConnected(res.success))
+          .catch(() => setIsConnected(false));
+      } else {
+        setIsConnected(false);
+      }
     });
+    return () => unsub();
   }, []);
+
+  const handleGoogleCloudSignIn = async () => {
+    setIsSigningInCloud(true);
+    setStatusMessage(null);
+    const res = await signInWithGoogleCloud();
+    setIsSigningInCloud(false);
+    if (res.success && res.user) {
+      setStatusMessage({
+        text: `Sesión Cloud iniciada como ${res.user.email || res.user.displayName || 'Google'}`,
+        type: 'success',
+      });
+    } else if (res.error) {
+      setStatusMessage({ text: res.error, type: 'error' });
+    }
+  };
+
+  const handleGoogleCloudSignOut = async () => {
+    await signOutGoogleCloud();
+    setIsConnected(false);
+    setStatusMessage({ text: 'Sesión de Google Cloud cerrada.', type: 'info' });
+  };
 
   const handleTestConnection = async () => {
     setIsTesting(true);
@@ -251,6 +293,42 @@ export const FirebaseSyncSettings: React.FC<FirebaseSyncSettingsProps> = ({
                   Los pedidos realizados por clientes en la tienda virtual llegan instantáneamente a la pantalla del cajero.
                 </p>
               </div>
+            </div>
+
+            {/* Cuenta Google Cloud (Firebase Authentication) */}
+            <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="space-y-0.5 min-w-0">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block">
+                  Autenticación Google Cloud:
+                </span>
+                {cloudUser ? (
+                  <p className="text-xs text-emerald-300 font-semibold truncate">
+                    ✓ {cloudUser.email || cloudUser.displayName} {cloudUser.emailVerified ? '(Verificado)' : '(Sin verificar)'}
+                  </p>
+                ) : (
+                  <p className="text-xs text-amber-300">
+                    Inicia sesión con tu cuenta Google autorizada para leer/escribir en Firestore.
+                  </p>
+                )}
+              </div>
+              {cloudUser ? (
+                <button
+                  type="button"
+                  onClick={handleGoogleCloudSignOut}
+                  className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 shrink-0 cursor-pointer"
+                >
+                  Cerrar Sesión Google
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleGoogleCloudSignIn}
+                  disabled={isSigningInCloud}
+                  className="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-xs shrink-0 cursor-pointer disabled:opacity-50"
+                >
+                  {isSigningInCloud ? 'Conectando...' : 'Conectar con Google'}
+                </button>
+              )}
             </div>
 
             {/* Acciones principales */}

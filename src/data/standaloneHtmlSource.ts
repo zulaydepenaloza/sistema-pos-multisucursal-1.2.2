@@ -6705,7 +6705,7 @@ export const STANDALONE_HTML_SOURCE = `<!DOCTYPE html>
 
         <div>
           <label class="block text-slate-400 mb-1">
-            2. Ingresa el PIN de Administrador (Ana Morales / 1111):
+            2. Ingresa el PIN de Administrador autorizado:
           </label>
           <input type="password" id="reset-confirm-pin-input" oninput="validateResetInputs()" maxlength="6" placeholder="PIN de 4 dígitos" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white font-mono text-center tracking-widest">
         </div>
@@ -6952,9 +6952,9 @@ export const STANDALONE_HTML_SOURCE = `<!DOCTYPE html>
       const isWordValid = wordInput.value.trim().toUpperCase() === 'REINICIAR';
       const enteredPin = pinInput.value.trim();
 
-      // Check if pin matches any admin user or current user
+      // Check if pin matches an authorized admin user strictly (no hardcoded bypass PINs)
       const adminUsers = (AppState.usuarios || []).filter(u => u.rol === 'admin');
-      const isAdminPinValid = adminUsers.some(u => u.pin === enteredPin) || enteredPin === '1111' || enteredPin === '1234' || enteredPin === '9999' || enteredPin === '1001' || (AppState.currentUser && AppState.currentUser.pin === enteredPin);
+      const isAdminPinValid = adminUsers.some(u => u.pin === enteredPin);
 
       if (isWordValid && enteredPin.length >= 4 && isAdminPinValid) {
         btn.disabled = false;
@@ -7068,11 +7068,10 @@ export const STANDALONE_HTML_SOURCE = `<!DOCTYPE html>
 
     
     // =========================================================================
-    // MOTOR CRIPTOGRÁFICO DE LICENCIAMIENTO POR HARDWARE FINGERPRINT
+    // MOTOR CRIPTOGRÁFICO DE EVALUACIÓN PARA EXPORTACIÓN STANDALONE
     // =========================================================================
     const LICENSE_STORAGE_KEY = 'pos_app_crypto_license_v1';
-    const LICENSE_SECRET_KEY = 'POS_CRYPT_SEC_KEY_VAL_2026_MULTI_BRANCH_LATAM_G82X';
-    const DEV_MASTER_PIN = '9900';
+    const STANDALONE_DEMO_TAG = 'DEMO_EVAL_V2';
 
     // Pure JavaScript SHA-256 (100% Offline Compatible)
     function sha256(str) {
@@ -7173,55 +7172,67 @@ export const STANDALONE_HTML_SOURCE = `<!DOCTYPE html>
       return 'POS-' + p1 + '-' + p2 + '-' + p3 + '-' + p4;
     }
 
-    function signPayload(payloadJsonStr, machineId) {
-      const message = payloadJsonStr + '::' + LICENSE_SECRET_KEY + '::' + machineId.trim().toUpperCase();
+    function signDemoPayload(base64Payload, machineId) {
+      const message = STANDALONE_DEMO_TAG + '::' + base64Payload + '::' + machineId.trim().toUpperCase();
       return sha256(message).substring(0, 16).toUpperCase();
     }
 
-    function generateActivationKey(payload) {
-      const jsonStr = JSON.stringify(payload);
-      const base64Payload = btoa(unescape(encodeURIComponent(jsonStr)));
-      const signature = signPayload(jsonStr, payload.machineId);
-      return 'LIC-' + base64Payload + '.' + signature;
+    function generateDemoActivationKey(payload) {
+      const demoPayload = Object.assign({}, payload, { tipo: 'demo' });
+      const jsonStr = JSON.stringify(demoPayload);
+      const base64Payload = btoa(unescape(encodeURIComponent(jsonStr)))
+        .replace(/\\+/g, '-')
+        .replace(/\\//g, '_')
+        .replace(/=+$/, '');
+      const signature = signDemoPayload(base64Payload, demoPayload.machineId);
+      return 'DEMO-' + base64Payload + '.' + signature;
     }
 
     function validateActivationKey(key) {
       const thisMachineId = getMachineFingerprint();
-      if (!key || typeof key !== 'string' || !key.startsWith('LIC-')) {
-        return { isValid: false, isExpired: false, isMachineMismatch: false, isTampered: false, status: 'unlicensed', message: 'No se ha registrado una clave de licencia autorizada.' };
+      if (!key || typeof key !== 'string' || !key.startsWith('DEMO-')) {
+        return { isValid: false, isExpired: false, isMachineMismatch: false, isTampered: false, status: 'unlicensed', message: 'No se ha registrado una licencia de evaluación válida (use la versión conectada al servidor para claves ED2-).' };
       }
-      const parts = key.slice(4).split('.');
+      const parts = key.slice(5).split('.');
       if (parts.length !== 2) {
         return { isValid: false, isExpired: false, isMachineMismatch: false, isTampered: true, status: 'tampered', message: 'El formato de la clave de licencia es inválido o está corrupto.' };
       }
       const [base64Payload, providedSignature] = parts;
       let payload;
       try {
-        const jsonStr = decodeURIComponent(escape(atob(base64Payload)));
+        const standardB64 = base64Payload.replace(/-/g, '+').replace(/_/g, '/');
+        const jsonStr = decodeURIComponent(escape(atob(standardB64)));
         payload = JSON.parse(jsonStr);
       } catch (e) {
-        return { isValid: false, isExpired: false, isMachineMismatch: false, isTampered: true, status: 'tampered', message: 'No se pudo decodificar el contenido criptográfico de la licencia.' };
+        return { isValid: false, isExpired: false, isMachineMismatch: false, isTampered: true, status: 'tampered', message: 'No se pudo decodificar el contenido de la licencia.' };
+      }
+
+      if (payload.tipo !== 'demo' || !payload.fechaEmision || !payload.fechaVencimiento) {
+        return { isValid: false, isExpired: false, isMachineMismatch: false, isTampered: true, status: 'tampered', message: 'Licencia de evaluación inválida.' };
+      }
+
+      const spanDays = Math.ceil((new Date(payload.fechaVencimiento) - new Date(payload.fechaEmision)) / 86400000);
+      if (!Number.isFinite(spanDays) || spanDays < 0 || spanDays > 16) {
+        return { isValid: false, isExpired: false, isMachineMismatch: false, isTampered: true, status: 'tampered', message: 'La licencia de evaluación excede los 15 días permitidos.' };
       }
 
       if (payload.machineId.trim().toUpperCase() !== thisMachineId.trim().toUpperCase()) {
-        return { isValid: false, isExpired: false, isMachineMismatch: true, isTampered: false, status: 'machine_mismatch', payload, message: 'Esta clave de licencia pertenece a otra máquina (' + payload.machineId + ') y no a este equipo (' + thisMachineId + ').' };
+        return { isValid: false, isExpired: false, isMachineMismatch: true, isTampered: false, status: 'machine_mismatch', payload, message: 'Esta clave pertenece a otra máquina (' + payload.machineId + ').' };
       }
 
-      const expectedSig = signPayload(JSON.stringify(payload), payload.machineId);
+      const expectedSig = signDemoPayload(base64Payload, payload.machineId);
       if (providedSignature.toUpperCase() !== expectedSig.toUpperCase()) {
-        return { isValid: false, isExpired: false, isMachineMismatch: false, isTampered: true, status: 'tampered', payload, message: 'Firma digital inválida. La clave ha sido manipulada o adulterada.' };
+        return { isValid: false, isExpired: false, isMachineMismatch: false, isTampered: true, status: 'tampered', payload, message: 'Código de verificación inválido.' };
       }
 
-      if (payload.fechaVencimiento && payload.fechaVencimiento !== 'VITALICIA') {
-        const expDate = new Date(payload.fechaVencimiento);
-        const today = new Date();
-        today.setHours(0,0,0,0);
-        if (expDate < today) {
-          return { isValid: false, isExpired: true, isMachineMismatch: false, isTampered: false, status: 'expired', payload, message: 'El período de validez de esta licencia expiró el ' + payload.fechaVencimiento + '.' };
-        }
+      const expDate = new Date(payload.fechaVencimiento);
+      const today = new Date();
+      today.setHours(0,0,0,0);
+      if (expDate < today) {
+        return { isValid: false, isExpired: true, isMachineMismatch: false, isTampered: false, status: 'expired', payload, message: 'El período de evaluación expiró el ' + payload.fechaVencimiento + '.' };
       }
 
-      return { isValid: true, isExpired: false, isMachineMismatch: false, isTampered: false, status: 'active', payload, message: 'Licencia autorizada y verificada criptográficamente.' };
+      return { isValid: true, isExpired: false, isMachineMismatch: false, isTampered: false, status: 'active', payload, message: 'Licencia de evaluación activa (15 días).' };
     }
 
     function getStoredLicenseKey() {
@@ -7241,15 +7252,16 @@ export const STANDALONE_HTML_SOURCE = `<!DOCTYPE html>
     function checkLicenseStatus() {
       let key = getStoredLicenseKey();
       if (!key) {
-        // Auto-provision initial Lifetime Developer / POS License for this machine
-        const autoKey = generateActivationKey({
+        const expDate = new Date();
+        expDate.setDate(expDate.getDate() + 15);
+        const autoKey = generateDemoActivationKey({
           machineId: getMachineFingerprint(),
-          empresa: AppState.empresaConfig.nombreEmpresa || 'Corporación Los Andes C.A.',
-          rif: AppState.empresaConfig.rif || 'J-12345678-0',
-          tipo: 'vitalicia',
+          empresa: AppState.empresaConfig.nombreEmpresa || 'Evaluación Local POS',
+          rif: AppState.empresaConfig.rif || 'J-00000000-0',
+          tipo: 'demo',
           fechaEmision: new Date().toISOString().split('T')[0],
-          fechaVencimiento: 'VITALICIA',
-          cajasMax: 3,
+          fechaVencimiento: expDate.toISOString().split('T')[0],
+          cajasMax: 2,
           sucursalesMax: 2
         });
         saveLicenseKey(autoKey);
@@ -7316,7 +7328,7 @@ export const STANDALONE_HTML_SOURCE = `<!DOCTYPE html>
       const today = new Date();
       const expDate = new Date();
       expDate.setDate(today.getDate() + 15);
-      const trialKey = generateActivationKey({
+      const trialKey = generateDemoActivationKey({
         machineId: getMachineFingerprint(),
         empresa: AppState.empresaConfig.nombreEmpresa || 'Cliente Demo',
         rif: AppState.empresaConfig.rif || 'J-00000000-0',
@@ -7372,15 +7384,7 @@ export const STANDALONE_HTML_SOURCE = `<!DOCTYPE html>
     }
 
     function unlockDevGenerator() {
-      const pin = document.getElementById('cfg-dev-pin-input').value;
-      if (pin === DEV_MASTER_PIN) {
-        document.getElementById('cfg-dev-generator-fields').classList.remove('hidden');
-        document.getElementById('cfg-dev-unlock-wrap').classList.add('hidden');
-        document.getElementById('cfg-dev-lock-hint').classList.add('hidden');
-        setGenMachineIdToThis();
-      } else {
-        alert('PIN de Desarrollador incorrecto.');
-      }
+      alert('La emisión de licencias comerciales Ed25519 solo está disponible en la aplicación conectada al servidor seguro.');
     }
 
     function setGenMachineIdToThis() {
@@ -7389,48 +7393,7 @@ export const STANDALONE_HTML_SOURCE = `<!DOCTYPE html>
     }
 
     function generateDevKey() {
-      const machineId = document.getElementById('cfg-gen-machine-id').value.trim();
-      const empresa = document.getElementById('cfg-gen-empresa').value.trim();
-      const rif = document.getElementById('cfg-gen-rif').value.trim();
-      const tipo = document.getElementById('cfg-gen-tipo').value;
-      const cajasMax = parseInt(document.getElementById('cfg-gen-cajas').value, 10) || 3;
-      const sucursalesMax = parseInt(document.getElementById('cfg-gen-sucursales').value, 10) || 2;
-
-      if (!machineId) {
-        alert('Ingrese el ID de Hardware');
-        return;
-      }
-
-      const today = new Date();
-      let fechaVencimiento = 'VITALICIA';
-      if (tipo === 'demo') {
-        const d = new Date(); d.setDate(today.getDate() + 15);
-        fechaVencimiento = d.toISOString().split('T')[0];
-      } else if (tipo === 'mensual') {
-        const d = new Date(); d.setDate(today.getDate() + 30);
-        fechaVencimiento = d.toISOString().split('T')[0];
-      } else if (tipo === 'semestral') {
-        const d = new Date(); d.setDate(today.getDate() + 180);
-        fechaVencimiento = d.toISOString().split('T')[0];
-      } else if (tipo === 'anual') {
-        const d = new Date(); d.setFullYear(today.getFullYear() + 1);
-        fechaVencimiento = d.toISOString().split('T')[0];
-      }
-
-      const payload = {
-        machineId,
-        empresa,
-        rif,
-        tipo,
-        fechaEmision: today.toISOString().split('T')[0],
-        fechaVencimiento,
-        cajasMax,
-        sucursalesMax
-      };
-
-      const key = generateActivationKey(payload);
-      document.getElementById('cfg-gen-key-text').textContent = key;
-      document.getElementById('cfg-gen-result-box').classList.remove('hidden');
+      alert('La generación de licencias comerciales requiere el servidor backend seguro con firma Ed25519.');
     }
 
     function copyDevKey() {
@@ -10511,7 +10474,8 @@ export const STANDALONE_HTML_SOURCE = `<!DOCTYPE html>
         return;
       }
       const adminPin = prompt('Por motivos de seguridad, ingresa el PIN de Gerente General / Administrador para confirmar la limpieza:');
-      if (adminPin !== '1234' && (!AppState.currentUser || AppState.currentUser.pin !== adminPin)) {
+      const adminUsers = (AppState.usuarios || []).filter(u => u.rol === 'admin');
+      if (!adminPin || !adminUsers.some(u => u.pin === adminPin)) {
         alert('PIN incorrecto o no autorizado. Limpieza cancelada.');
         return;
       }

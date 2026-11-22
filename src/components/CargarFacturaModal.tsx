@@ -26,6 +26,7 @@ import { formatUSD, formatBs } from '../lib/currency';
 import { findMatchingProveedor } from '../lib/validations';
 import { WholesalePackConverter } from './WholesalePackConverter';
 import { ensurePosSessionToken, buildPosAuthHeaders } from '../lib/posSession';
+import { fetchApi } from '../lib/apiFetch';
 
 interface ParsedItem {
   codigo_barras?: string;
@@ -428,7 +429,7 @@ export const CargarFacturaModal: React.FC<CargarFacturaModalProps> = ({
 
       setProcessingStatus('Enviando factura al motor de lectura IA...');
 
-      const startResponse = await fetch('/api/compras/parse-invoice/start', {
+      const startResponse = await fetchApi('/api/compras/parse-invoice/start', {
         method: 'POST',
         headers: buildPosAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({

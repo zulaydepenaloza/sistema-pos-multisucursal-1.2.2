@@ -3,10 +3,20 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     // -------------------------------------------------------------
-    // Global Safety Helpers
+    // 1. Master Gate: Default-Deny Catch-All Safety Net
+    // -------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------
+    // 2. Hardened Identity & Safety Primitives
     // -------------------------------------------------------------
     function isValidId(id) {
-      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string
+        && id.size() > 0
+        && id.size() <= 128
+        && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
     function incoming() {
@@ -17,45 +27,133 @@ service cloud.firestore {
       return resource.data;
     }
 
+    function isSignedIn() {
+      return request.auth != null
+        && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isSignedIn()
+        && request.auth.token.email is string
+        && request.auth.token.email == 'diomrondon@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin()
+        || (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function isAuthorizedStaff() {
+      return isAdmin()
+        || (
+          isSignedIn()
+          && exists(/databases/$(database)/documents/authorized_staff/$(request.auth.uid))
+          && get(/databases/$(database)/documents/authorized_staff/$(request.auth.uid)).data.activo == true
+        );
+    }
+
     // -------------------------------------------------------------
-    // Domain Entity Validation Blueprints
+    // 3. Domain Validation Blueprints (Anti-Update-Gap & Strict Keys)
     // -------------------------------------------------------------
 
-    // Products: Validates name, positive price and valid barcode
+    function isValidAdminUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'role'])
+        && data.keys().hasOnly(['uid', 'email', 'role', 'createdAt'])
+        && data.uid is string && data.uid.size() > 0 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.email is string && data.email.size() > 3 && data.email.size() <= 200
+        && data.role == 'admin'
+        && (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64));
+    }
+
+    function isValidAuthorizedStaff(data) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'activo'])
+        && data.keys().hasOnly(['uid', 'email', 'role', 'activo', 'createdAt'])
+        && data.uid is string && data.uid.size() > 0 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.email is string && data.email.size() > 3 && data.email.size() <= 200
+        && data.role is string && data.role in ['admin', 'supervisor', 'cajero', 'inventario']
+        && data.activo is bool
+        && (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64));
+    }
+
     function isValidProducto(data) {
-      return data.nombre is string 
-        && data.nombre.size() > 0 
-        && data.nombre.size() <= 200
-        && data.precio is number 
-        && data.precio >= 0
+      return data.keys().hasAll(['id', 'nombre', 'precio'])
+        && data.keys().hasOnly([
+          'id', 'codigo_barras', 'nombre', 'categoria', 'unidad_medida',
+          'descripcion', 'precio', 'costo', 'stock_minimo', 'exento_iva',
+          'destacadoTienda', 'imagen'
+        ])
+        && data.id is number
+        && data.nombre is string && data.nombre.size() > 0 && data.nombre.size() <= 200
+        && data.precio is number && data.precio >= 0
         && (!('codigo_barras' in data) || (data.codigo_barras is string && data.codigo_barras.size() <= 100))
+        && (!('categoria' in data) || (data.categoria is string && data.categoria.size() <= 120))
+        && (!('unidad_medida' in data) || (data.unidad_medida is string && data.unidad_medida.size() <= 40))
+        && (!('descripcion' in data) || (data.descripcion is string && data.descripcion.size() <= 500))
         && (!('costo' in data) || (data.costo is number && data.costo >= 0))
-        && (!('stock_minimo' in data) || (data.stock_minimo is number && data.stock_minimo >= 0 && data.stock_minimo <= 1000000));
+        && (!('stock_minimo' in data) || (data.stock_minimo is number && data.stock_minimo >= 0 && data.stock_minimo <= 1000000))
+        && (!('exento_iva' in data) || data.exento_iva is bool)
+        && (!('destacadoTienda' in data) || data.destacadoTienda is bool)
+        && (!('imagen' in data) || (data.imagen is string && data.imagen.size() <= 2000));
     }
 
-    // Online Web Orders placed by customers
     function isValidPedidoOnline(data) {
-      return data.clienteNombre is string 
-        && data.clienteNombre.size() > 0 
-        && data.clienteNombre.size() <= 150
-        && data.clienteTelefono is string 
-        && data.clienteTelefono.size() >= 5 
-        && data.clienteTelefono.size() <= 35
-        && data.total is number 
-        && data.total >= 0
-        && data.estado is string 
-        && data.estado in ['pendiente', 'confirmado', 'preparando', 'despachado', 'en_camino', 'entregado', 'cancelado'];
+      return data.keys().hasAll(['id', 'fecha', 'clienteNombre', 'clienteTelefono', 'total', 'estado'])
+        && data.keys().hasOnly([
+          'id', 'numeroPedido', 'fecha', 'creadoEn', 'clienteNombre', 'clienteTelefono',
+          'clienteRif', 'clienteCedula', 'direccionEntrega', 'tipoEntrega', 'metodoPago',
+          'referenciaPago', 'detallePago', 'sucursalId', 'sucursalNombre',
+          'subtotalNeto', 'baseImponible', 'montoExento', 'montoIva', 'costoDelivery',
+          'total', 'totalBs', 'tasaCambio', 'ventaIdGenerada', 'notas', 'detalles', 'estado'
+        ])
+        && isValidId(data.id)
+        && data.fecha is string && data.fecha.size() > 0 && data.fecha.size() <= 64
+        && data.clienteNombre is string && data.clienteNombre.size() > 0 && data.clienteNombre.size() <= 150
+        && data.clienteTelefono is string && data.clienteTelefono.size() >= 5 && data.clienteTelefono.size() <= 35
+        && data.total is number && data.total >= 0
+        && data.estado is string && data.estado in ['pendiente', 'confirmado', 'preparando', 'despachado', 'en_camino', 'entregado', 'cancelado', 'facturado']
+        && (!('numeroPedido' in data) || (data.numeroPedido is string && data.numeroPedido.size() <= 50))
+        && (!('creadoEn' in data) || (data.creadoEn is string && data.creadoEn.size() <= 64))
+        && (!('clienteRif' in data) || (data.clienteRif is string && data.clienteRif.size() <= 40))
+        && (!('clienteCedula' in data) || (data.clienteCedula is string && data.clienteCedula.size() <= 40))
+        && (!('direccionEntrega' in data) || (data.direccionEntrega is string && data.direccionEntrega.size() <= 300))
+        && (!('tipoEntrega' in data) || (data.tipoEntrega is string && data.tipoEntrega in ['delivery', 'pickup', 'retiro']))
+        && (!('metodoPago' in data) || (data.metodoPago is string && data.metodoPago.size() <= 50))
+        && (!('referenciaPago' in data) || (data.referenciaPago is string && data.referenciaPago.size() <= 100))
+        && (!('detallePago' in data) || (data.detallePago is string && data.detallePago.size() <= 250))
+        && (!('sucursalId' in data) || data.sucursalId is number)
+        && (!('sucursalNombre' in data) || (data.sucursalNombre is string && data.sucursalNombre.size() <= 150))
+        && (!('subtotalNeto' in data) || (data.subtotalNeto is number && data.subtotalNeto >= 0))
+        && (!('baseImponible' in data) || (data.baseImponible is number && data.baseImponible >= 0))
+        && (!('montoExento' in data) || (data.montoExento is number && data.montoExento >= 0))
+        && (!('montoIva' in data) || (data.montoIva is number && data.montoIva >= 0))
+        && (!('costoDelivery' in data) || (data.costoDelivery is number && data.costoDelivery >= 0))
+        && (!('totalBs' in data) || (data.totalBs is number && data.totalBs >= 0))
+        && (!('tasaCambio' in data) || (data.tasaCambio is number && data.tasaCambio >= 0))
+        && (!('ventaIdGenerada' in data) || data.ventaIdGenerada is number)
+        && (!('notas' in data) || (data.notas is string && data.notas.size() <= 300))
+        && (!('detalles' in data) || (data.detalles is list && data.detalles.size() > 0 && data.detalles.size() <= 200 && data.detalles[0] is map));
     }
 
-    // Company Configuration and Exchange Rate (allows blank fiscal info on clean factory install)
     function isValidEmpresaConfig(data) {
-      return data.nombreEmpresa is string 
-        && data.nombreEmpresa.size() <= 200
-        && data.tasaCambio is number 
-        && data.tasaCambio >= 0
+      return data.keys().hasAll(['nombreEmpresa', 'tasaCambio'])
+        && data.keys().hasOnly([
+          'nombreEmpresa', 'rif', 'direccionFiscal', 'telefono', 'logoUrl',
+          'piePaginaTicket', 'nombreTienda1', 'nombreTienda2', 'nombreOficina',
+          'tasaCambio', 'fechaTasa', 'ultimaActualizacionTasa',
+          'factoryResetAt', 'fiscalUpdatedAt', 'stockMinimoAlerta'
+        ])
+        && data.nombreEmpresa is string && data.nombreEmpresa.size() <= 200
+        && data.tasaCambio is number && data.tasaCambio >= 0
         && (!('rif' in data) || (data.rif is string && data.rif.size() <= 50))
         && (!('direccionFiscal' in data) || (data.direccionFiscal is string && data.direccionFiscal.size() <= 300))
         && (!('telefono' in data) || (data.telefono is string && data.telefono.size() <= 100))
+        && (!('logoUrl' in data) || (data.logoUrl is string && data.logoUrl.size() <= 2000))
+        && (!('piePaginaTicket' in data) || (data.piePaginaTicket is string && data.piePaginaTicket.size() <= 300))
+        && (!('nombreTienda1' in data) || (data.nombreTienda1 is string && data.nombreTienda1.size() <= 150))
+        && (!('nombreTienda2' in data) || (data.nombreTienda2 is string && data.nombreTienda2.size() <= 150))
+        && (!('nombreOficina' in data) || (data.nombreOficina is string && data.nombreOficina.size() <= 150))
+        && (!('fechaTasa' in data) || (data.fechaTasa is string && data.fechaTasa.size() <= 64))
+        && (!('ultimaActualizacionTasa' in data) || (data.ultimaActualizacionTasa is string && data.ultimaActualizacionTasa.size() <= 64))
         && (!('factoryResetAt' in data) || (data.factoryResetAt is string && data.factoryResetAt.size() <= 64))
         && (!('fiscalUpdatedAt' in data) || (data.fiscalUpdatedAt is string && data.fiscalUpdatedAt.size() <= 64))
         && (!('stockMinimoAlerta' in data) || (data.stockMinimoAlerta is number && data.stockMinimoAlerta >= 0 && data.stockMinimoAlerta <= 1000000));
@@ -100,190 +198,360 @@ service cloud.firestore {
         );
     }
 
-    // Digital Store Settings
     function isValidTiendaConfig(data) {
-      return (!('whatsappContacto' in data) || (data.whatsappContacto is string && data.whatsappContacto.size() <= 40))
+      return data.keys().hasOnly([
+          'habilitada', 'nombreTienda', 'whatsappContacto', 'mensajeBienvenida',
+          'bannerPromo', 'pagoMovilBanco', 'pagoMovilTelefono', 'pagoMovilRif',
+          'pagoMovilCedula', 'zelleTitular', 'zelleCorreo', 'horarioAtencion',
+          'permitePickup', 'permiteDelivery', 'costoDeliveryFijo', 'costoDeliveryBase',
+          'deliveryGratisMinimo', 'montoMinimoEnvioGratis'
+        ])
+        && (!('habilitada' in data) || data.habilitada is bool)
+        && (!('nombreTienda' in data) || (data.nombreTienda is string && data.nombreTienda.size() <= 150))
+        && (!('whatsappContacto' in data) || (data.whatsappContacto is string && data.whatsappContacto.size() <= 40))
+        && (!('mensajeBienvenida' in data) || (data.mensajeBienvenida is string && data.mensajeBienvenida.size() <= 300))
+        && (!('bannerPromo' in data) || (data.bannerPromo is string && data.bannerPromo.size() <= 300))
+        && (!('pagoMovilBanco' in data) || (data.pagoMovilBanco is string && data.pagoMovilBanco.size() <= 100))
+        && (!('pagoMovilTelefono' in data) || (data.pagoMovilTelefono is string && data.pagoMovilTelefono.size() <= 40))
+        && (!('pagoMovilRif' in data) || (data.pagoMovilRif is string && data.pagoMovilRif.size() <= 40))
+        && (!('pagoMovilCedula' in data) || (data.pagoMovilCedula is string && data.pagoMovilCedula.size() <= 40))
+        && (!('zelleTitular' in data) || (data.zelleTitular is string && data.zelleTitular.size() <= 120))
+        && (!('zelleCorreo' in data) || (data.zelleCorreo is string && data.zelleCorreo.size() <= 150))
+        && (!('horarioAtencion' in data) || (data.horarioAtencion is string && data.horarioAtencion.size() <= 150))
+        && (!('permitePickup' in data) || data.permitePickup is bool)
+        && (!('permiteDelivery' in data) || data.permiteDelivery is bool)
         && (!('costoDeliveryFijo' in data) || (data.costoDeliveryFijo is number && data.costoDeliveryFijo >= 0))
-        && (!('costoDeliveryBase' in data) || (data.costoDeliveryBase is number && data.costoDeliveryBase >= 0));
+        && (!('costoDeliveryBase' in data) || (data.costoDeliveryBase is number && data.costoDeliveryBase >= 0))
+        && (!('deliveryGratisMinimo' in data) || (data.deliveryGratisMinimo is number && data.deliveryGratisMinimo >= 0))
+        && (!('montoMinimoEnvioGratis' in data) || (data.montoMinimoEnvioGratis is number && data.montoMinimoEnvioGratis >= 0));
     }
 
-    // POS Sales and Financial Invoices
     function isValidVenta(data) {
-      return (!('numeroFactura' in data) || (data.numeroFactura is string && data.numeroFactura.size() <= 100))
-        && data.total is number 
-        && data.total >= 0
-        && data.fecha is string 
-        && data.fecha.size() > 0;
+      return data.keys().hasAll(['id', 'numeroFactura', 'fecha', 'total'])
+        && data.keys().hasOnly([
+          'id', 'txUid', 'numeroFactura', 'fecha', 'sucursal_id', 'usuario_id',
+          'usuario_nombre', 'cliente_id', 'cliente_nombre', 'cliente_rif',
+          'subtotal_neto', 'base_imponible', 'monto_exento', 'monto_iva',
+          'total', 'metodo_pago', 'referencia_pago', 'pago_detalle', 'detalles'
+        ])
+        && data.id is number
+        && data.numeroFactura is string && data.numeroFactura.size() > 0 && data.numeroFactura.size() <= 100
+        && data.fecha is string && data.fecha.size() > 0 && data.fecha.size() <= 64
+        && data.total is number && data.total >= 0
+        && (!('txUid' in data) || isValidId(data.txUid))
+        && (!('sucursal_id' in data) || data.sucursal_id is number)
+        && (!('usuario_id' in data) || data.usuario_id is number)
+        && (!('usuario_nombre' in data) || (data.usuario_nombre is string && data.usuario_nombre.size() <= 150))
+        && (!('cliente_id' in data) || data.cliente_id is number || data.cliente_id == null)
+        && (!('cliente_nombre' in data) || (data.cliente_nombre is string && data.cliente_nombre.size() <= 150))
+        && (!('cliente_rif' in data) || (data.cliente_rif is string && data.cliente_rif.size() <= 50))
+        && (!('subtotal_neto' in data) || (data.subtotal_neto is number && data.subtotal_neto >= 0))
+        && (!('base_imponible' in data) || (data.base_imponible is number && data.base_imponible >= 0))
+        && (!('monto_exento' in data) || (data.monto_exento is number && data.monto_exento >= 0))
+        && (!('monto_iva' in data) || (data.monto_iva is number && data.monto_iva >= 0))
+        && (!('metodo_pago' in data) || (data.metodo_pago is string && data.metodo_pago.size() <= 60))
+        && (!('referencia_pago' in data) || (data.referencia_pago is string && data.referencia_pago.size() <= 100))
+        && (!('pago_detalle' in data) || data.pago_detalle is map)
+        && (!('detalles' in data) || (data.detalles is list && data.detalles.size() <= 500 && (data.detalles.size() == 0 || data.detalles[0] is map)));
     }
 
-    // Branch Inventory
     function isValidInventario(data) {
-      return (!('items' in data) || data.items is list)
-        && (!('sucursalId' in data) || data.sucursalId is number);
+      return data.keys().hasAll(['items', 'sucursalId'])
+        && data.keys().hasOnly(['sucursalId', 'items', 'totalArticulos', 'updatedAt'])
+        && data.sucursalId is number
+        && data.items is list
+        && data.items.size() <= 5000
+        && (data.items.size() == 0 || data.items[0] is map)
+        && (!('totalArticulos' in data) || (data.totalArticulos is number && data.totalArticulos >= 0))
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
     }
 
-    // Branch Locations
     function isValidSucursal(data) {
-      return data.nombre is string 
-        && data.nombre.size() > 0 
-        && data.nombre.size() <= 150
-        && (!('tipo' in data) || (data.tipo is string && data.tipo in ['tienda', 'oficina']));
+      return data.keys().hasAll(['id', 'nombre', 'tipo'])
+        && data.keys().hasOnly(['id', 'nombre', 'tipo'])
+        && data.id is number
+        && data.nombre is string && data.nombre.size() > 0 && data.nombre.size() <= 150
+        && data.tipo is string && data.tipo in ['tienda', 'oficina'];
     }
 
-    // User Accounts
     function isValidUsuario(data) {
-      return data.nombre_completo is string 
-        && data.nombre_completo.size() > 0 
-        && data.username is string 
-        && data.rol in ['admin', 'supervisor', 'cajero', 'inventario'];
+      return data.keys().hasAll(['id', 'nombre_completo', 'username', 'rol'])
+        && data.keys().hasOnly([
+          'id', 'nombre_completo', 'username', 'pin', 'rol',
+          'sucursal_id', 'cargo', 'permisos', 'eliminado', 'updatedAt'
+        ])
+        && data.id is number
+        && data.nombre_completo is string && data.nombre_completo.size() > 0 && data.nombre_completo.size() <= 150
+        && data.username is string && data.username.size() > 0 && data.username.size() <= 80
+        && data.rol is string && data.rol in ['admin', 'supervisor', 'cajero', 'inventario']
+        && (!('pin' in data) || (data.pin is string && data.pin.size() <= 128))
+        && (!('sucursal_id' in data) || data.sucursal_id is number || data.sucursal_id == null)
+        && (!('cargo' in data) || (data.cargo is string && data.cargo.size() <= 120))
+        && (!('permisos' in data) || data.permisos is map)
+        && (!('eliminado' in data) || data.eliminado is bool)
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
     }
 
-    // Suppliers
     function isValidProveedor(data) {
-      return data.nombre is string 
-        && data.nombre.size() > 0 
-        && data.nombre.size() <= 200;
+      return data.keys().hasAll(['id', 'nombre'])
+        && data.keys().hasOnly(['id', 'nombre', 'rif', 'contacto', 'telefono', 'email', 'direccion', 'saldoPendiente'])
+        && data.id is number
+        && data.nombre is string && data.nombre.size() > 0 && data.nombre.size() <= 200
+        && (!('rif' in data) || (data.rif is string && data.rif.size() <= 50))
+        && (!('contacto' in data) || (data.contacto is string && data.contacto.size() <= 120))
+        && (!('telefono' in data) || (data.telefono is string && data.telefono.size() <= 40))
+        && (!('email' in data) || (data.email is string && data.email.size() <= 150))
+        && (!('direccion' in data) || (data.direccion is string && data.direccion.size() <= 300))
+        && (!('saldoPendiente' in data) || (data.saldoPendiente is number && data.saldoPendiente >= 0));
     }
 
-    // Purchases from Suppliers
     function isValidCompra(data) {
-      return (!('numeroFactura' in data) || (data.numeroFactura is string && data.numeroFactura.size() <= 100))
-        && data.total is number 
-        && data.total >= 0;
+      return data.keys().hasAll(['id', 'numeroFactura', 'fecha', 'total'])
+        && data.keys().hasOnly([
+          'id', 'numeroFactura', 'proveedorId', 'proveedorNombre', 'sucursalId',
+          'fecha', 'fechaVencimiento', 'condicionPago', 'estado', 'usuarioNombre',
+          'tasaRecepcion', 'pagarATasaRecepcion', 'detalles', 'total'
+        ])
+        && data.id is number
+        && data.numeroFactura is string && data.numeroFactura.size() > 0 && data.numeroFactura.size() <= 100
+        && data.fecha is string && data.fecha.size() > 0 && data.fecha.size() <= 64
+        && data.total is number && data.total >= 0
+        && (!('proveedorId' in data) || data.proveedorId is number)
+        && (!('proveedorNombre' in data) || (data.proveedorNombre is string && data.proveedorNombre.size() <= 200))
+        && (!('sucursalId' in data) || data.sucursalId is number)
+        && (!('fechaVencimiento' in data) || (data.fechaVencimiento is string && data.fechaVencimiento.size() <= 64))
+        && (!('condicionPago' in data) || (data.condicionPago is string && data.condicionPago in ['contado', 'credito']))
+        && (!('estado' in data) || (data.estado is string && data.estado.size() <= 40))
+        && (!('usuarioNombre' in data) || (data.usuarioNombre is string && data.usuarioNombre.size() <= 150))
+        && (!('tasaRecepcion' in data) || (data.tasaRecepcion is number && data.tasaRecepcion >= 0))
+        && (!('pagarATasaRecepcion' in data) || data.pagarATasaRecepcion is bool)
+        && (!('detalles' in data) || (data.detalles is list && data.detalles.size() <= 500 && (data.detalles.size() == 0 || data.detalles[0] is map)));
     }
 
-    // Financial Balances (CxP and CxC)
     function isValidCuentaFinanciera(data) {
-      return data.montoTotal is number 
-        && data.montoTotal >= 0
-        && (!('montoPagado' in data) || (data.montoPagado is number && data.montoPagado >= 0));
+      return data.keys().hasAll(['id', 'montoTotal', 'estado'])
+        && data.keys().hasOnly([
+          'id', 'clienteId', 'clienteNombre', 'proveedorId', 'proveedorNombre',
+          'facturaNumero', 'concepto', 'fechaEmision', 'fechaVencimiento',
+          'montoTotal', 'montoPagado', 'saldoRestante', 'abonos', 'pagos',
+          'tasaRecepcion', 'pagarATasaRecepcion', 'updatedAt', 'estado'
+        ])
+        && data.id is number
+        && data.montoTotal is number && data.montoTotal >= 0
+        && data.estado is string && data.estado in ['pendiente', 'parcial', 'pagada', 'vencida']
+        && (!('clienteId' in data) || data.clienteId is number)
+        && (!('clienteNombre' in data) || (data.clienteNombre is string && data.clienteNombre.size() <= 200))
+        && (!('proveedorId' in data) || data.proveedorId is number)
+        && (!('proveedorNombre' in data) || (data.proveedorNombre is string && data.proveedorNombre.size() <= 200))
+        && (!('facturaNumero' in data) || (data.facturaNumero is string && data.facturaNumero.size() <= 100))
+        && (!('concepto' in data) || (data.concepto is string && data.concepto.size() <= 250))
+        && (!('fechaEmision' in data) || (data.fechaEmision is string && data.fechaEmision.size() <= 64))
+        && (!('fechaVencimiento' in data) || (data.fechaVencimiento is string && data.fechaVencimiento.size() <= 64))
+        && (!('montoPagado' in data) || (data.montoPagado is number && data.montoPagado >= 0))
+        && (!('saldoRestante' in data) || (data.saldoRestante is number && data.saldoRestante >= 0))
+        && (!('abonos' in data) || (data.abonos is list && data.abonos.size() <= 500 && (data.abonos.size() == 0 || data.abonos[0] is map)))
+        && (!('pagos' in data) || (data.pagos is list && data.pagos.size() <= 500 && (data.pagos.size() == 0 || data.pagos[0] is map)))
+        && (!('tasaRecepcion' in data) || (data.tasaRecepcion is number && data.tasaRecepcion >= 0))
+        && (!('pagarATasaRecepcion' in data) || data.pagarATasaRecepcion is bool)
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
     }
 
-    // Immutable Audit Logs
     function isValidAuditoria(data) {
-      return (('accion' in data && data.accion is string && data.accion.size() <= 250) || 
-              ('tipo_accion' in data && data.tipo_accion is string && data.tipo_accion.size() <= 250))
-        && data.timestamp is string;
+      return data.keys().hasAll(['id', 'accion', 'timestamp'])
+        && data.keys().hasOnly([
+          'id', 'accion', 'tipo_accion', 'modulo', 'descripcion', 'detalles',
+          'usuario', 'usuario_id', 'usuario_username', 'usuario_rol',
+          'sucursal_id', 'sucursal_nombre', 'fecha', 'hora', 'timestamp'
+        ])
+        && isValidId(data.id)
+        && data.accion is string && data.accion.size() > 0 && data.accion.size() <= 250
+        && data.timestamp is string && data.timestamp.size() > 0 && data.timestamp.size() <= 64
+        && (!('tipo_accion' in data) || (data.tipo_accion is string && data.tipo_accion.size() <= 100))
+        && (!('modulo' in data) || (data.modulo is string && data.modulo.size() <= 120))
+        && (!('descripcion' in data) || (data.descripcion is string && data.descripcion.size() <= 500))
+        && (!('detalles' in data) || (data.detalles is string && data.detalles.size() <= 1000))
+        && (!('usuario' in data) || (data.usuario is string && data.usuario.size() <= 150))
+        && (!('usuario_id' in data) || data.usuario_id is number || data.usuario_id == null)
+        && (!('usuario_username' in data) || (data.usuario_username is string && data.usuario_username.size() <= 80))
+        && (!('usuario_rol' in data) || (data.usuario_rol is string && data.usuario_rol.size() <= 40))
+        && (!('sucursal_id' in data) || data.sucursal_id is number || data.sucursal_id == null)
+        && (!('sucursal_nombre' in data) || (data.sucursal_nombre is string && data.sucursal_nombre.size() <= 150))
+        && (!('fecha' in data) || (data.fecha is string && data.fecha.size() <= 40))
+        && (!('hora' in data) || (data.hora is string && data.hora.size() <= 40));
     }
 
     // -------------------------------------------------------------
-    // Collections Access Rules
+    // 4. Hardened Collection Access Rules (Verified Auth + RBAC)
     // -------------------------------------------------------------
 
-    // Health check and connection validation document
+    // Admin registry (UID-keyed)
+    match /admins/{uid} {
+      allow get: if isValidId(uid) && ((isSignedIn() && request.auth.uid == uid) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(uid) && isAdmin() && isValidAdminUser(incoming()) && incoming().uid == uid;
+      allow update: if isValidId(uid) && isAdmin() && isValidAdminUser(incoming()) && incoming().uid == existing().uid;
+      allow delete: if isValidId(uid) && isAdmin();
+    }
+
+    // Authorized POS staff registry (UID-keyed)
+    match /authorized_staff/{uid} {
+      allow get: if isValidId(uid) && ((isSignedIn() && request.auth.uid == uid) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(uid) && isAdmin() && isValidAuthorizedStaff(incoming()) && incoming().uid == uid;
+      allow update: if isValidId(uid) && isAdmin() && isValidAuthorizedStaff(incoming()) && incoming().uid == existing().uid;
+      allow delete: if isValidId(uid) && isAdmin();
+    }
+
+    // Connection ping document (only authenticated verified users)
     match /test/{docId} {
-      allow get, write: if isValidId(docId);
-      allow list: if false;
+      allow get: if isValidId(docId) && isSignedIn();
+      allow list, write: if false;
     }
 
-    // Products: Public read for digital catalog and POS; validated writes
+    // Products Catalog
     match /productos/{productoId} {
-      allow read: if true;
-      allow create, update: if isValidId(productoId) && isValidProducto(incoming());
-      allow delete: if isValidId(productoId);
+      allow get: if isValidId(productoId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(productoId) && isAuthorizedStaff() && isValidProducto(incoming());
+      allow update: if isValidId(productoId) && isAuthorizedStaff() && isValidProducto(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'codigo_barras', 'nombre', 'categoria', 'unidad_medida',
+          'descripcion', 'precio', 'costo', 'stock_minimo', 'exento_iva',
+          'destacadoTienda', 'imagen'
+        ]);
+      allow delete: if isValidId(productoId) && isAdmin();
     }
 
-    // Online Web Orders placed by customers
+    // Online Web Orders (contains customer PII - protected)
     match /pedidos_online/{pedidoId} {
-      allow get: if isValidId(pedidoId);
-      allow list: if true;
-      allow create: if isValidId(pedidoId) && isValidPedidoOnline(incoming());
-      allow update: if isValidId(pedidoId) && isValidPedidoOnline(incoming());
-      allow delete: if isValidId(pedidoId);
+      allow get: if isValidId(pedidoId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(pedidoId) && isAuthorizedStaff() && isValidPedidoOnline(incoming());
+      allow update: if isValidId(pedidoId) && isAuthorizedStaff() && isValidPedidoOnline(incoming()) && (
+        isAdmin()
+        || (
+          existing().estado != 'entregado'
+          && existing().estado != 'cancelado'
+          && incoming().diff(existing()).affectedKeys().hasOnly(['estado', 'detallePago', 'ventaIdGenerada', 'notas'])
+        )
+      );
+      allow delete: if isValidId(pedidoId) && isAdmin();
     }
 
-    // Enterprise Configuration and Daily BCV Exchange Rate
+    // Enterprise Configuration & Daily Rate
     match /empresa_config/{configId} {
-      allow read: if true;
-      allow create: if isValidId(configId) && isValidEmpresaConfig(incoming()) && isIncomingFiscalAllowedAgainstReset(incoming());
-      allow update: if isValidId(configId) && isValidEmpresaConfig(incoming()) && isEmpresaUpdateAllowed(incoming(), existing());
-      allow delete: if isValidId(configId);
+      allow get: if isValidId(configId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(configId) && isAdmin() && isValidEmpresaConfig(incoming()) && isIncomingFiscalAllowedAgainstReset(incoming());
+      allow update: if isValidId(configId) && isAuthorizedStaff() && isValidEmpresaConfig(incoming()) && isEmpresaUpdateAllowed(incoming(), existing()) && (
+        isAdmin()
+        || incoming().diff(existing()).affectedKeys().hasOnly(['tasaCambio', 'fechaTasa', 'ultimaActualizacionTasa'])
+      );
+      allow delete: if isValidId(configId) && isAdmin();
     }
 
-    // Digital Store Configuration (WhatsApp, Delivery, Pago Móvil)
+    // Digital Store Settings
     match /tienda_config/{configId} {
-      allow read: if true;
-      allow create, update: if isValidId(configId) && isValidTiendaConfig(incoming());
-      allow delete: if isValidId(configId);
+      allow get: if isValidId(configId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(configId) && isAdmin() && isValidTiendaConfig(incoming());
+      allow update: if isValidId(configId) && isAdmin() && isValidTiendaConfig(incoming());
+      allow delete: if isValidId(configId) && isAdmin();
     }
 
-    // POS Sales and Invoices: Immutable updates, cleanup allowed on factory reset
+    // POS Sales and Invoices (Append-only operational records; Admin-only factory purge)
     match /ventas/{ventaId} {
-      allow get: if isValidId(ventaId);
-      allow list: if true;
-      allow create: if isValidId(ventaId) && isValidVenta(incoming());
+      allow get: if isValidId(ventaId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(ventaId) && isAuthorizedStaff() && isValidVenta(incoming());
       allow update: if false;
-      allow delete: if isValidId(ventaId);
+      allow delete: if isValidId(ventaId) && isAdmin();
     }
 
-    // Branch Inventory: Isolated stock tracking
+    // Branch-Isolated Inventory (`sucursal_{id}`)
     match /inventario/{docId} {
-      allow get: if isValidId(docId);
-      allow list: if true;
-      allow create, update: if isValidId(docId) && isValidInventario(incoming());
-      allow delete: if isValidId(docId);
+      allow get: if isValidId(docId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(docId) && isAuthorizedStaff() && isValidInventario(incoming());
+      allow update: if isValidId(docId) && isAuthorizedStaff() && isValidInventario(incoming())
+        && incoming().sucursalId == existing().sucursalId
+        && incoming().diff(existing()).affectedKeys().hasOnly(['items', 'totalArticulos', 'updatedAt']);
+      allow delete: if isValidId(docId) && isAdmin();
     }
 
     // Branch Locations
     match /sucursales/{sucursalId} {
-      allow get: if isValidId(sucursalId);
-      allow list: if true;
-      allow create, update: if isValidId(sucursalId) && isValidSucursal(incoming());
-      allow delete: if isValidId(sucursalId);
+      allow get: if isValidId(sucursalId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(sucursalId) && isAdmin() && isValidSucursal(incoming());
+      allow update: if isValidId(sucursalId) && isAdmin() && isValidSucursal(incoming());
+      allow delete: if isValidId(sucursalId) && isAdmin();
     }
 
-    // System Users and Operators
+    // System Users & Hashed PINs (Strictly Admin write; Staff read)
     match /usuarios/{usuarioId} {
-      allow get: if isValidId(usuarioId);
-      allow list: if true;
-      allow create, update: if isValidId(usuarioId) && isValidUsuario(incoming());
-      allow delete: if isValidId(usuarioId);
+      allow get: if isValidId(usuarioId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(usuarioId) && isAdmin() && isValidUsuario(incoming());
+      allow update: if isValidId(usuarioId) && isAdmin() && isValidUsuario(incoming());
+      allow delete: if isValidId(usuarioId) && isAdmin();
     }
 
     // Suppliers Catalog
     match /proveedores/{proveedorId} {
-      allow get: if isValidId(proveedorId);
-      allow list: if true;
-      allow create, update: if isValidId(proveedorId) && isValidProveedor(incoming());
-      allow delete: if isValidId(proveedorId);
+      allow get: if isValidId(proveedorId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(proveedorId) && isAuthorizedStaff() && isValidProveedor(incoming());
+      allow update: if isValidId(proveedorId) && isAuthorizedStaff() && isValidProveedor(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['nombre', 'rif', 'contacto', 'telefono', 'email', 'direccion', 'saldoPendiente']);
+      allow delete: if isValidId(proveedorId) && isAdmin();
     }
 
-    // Purchase Invoices: Immutable updates, cleanup allowed on factory reset
+    // Purchase Invoices (Append-only operational records; Admin-only factory purge)
     match /compras/{compraId} {
-      allow get: if isValidId(compraId);
-      allow list: if true;
-      allow create: if isValidId(compraId) && isValidCompra(incoming());
+      allow get: if isValidId(compraId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(compraId) && isAuthorizedStaff() && isValidCompra(incoming());
       allow update: if false;
-      allow delete: if isValidId(compraId);
+      allow delete: if isValidId(compraId) && isAdmin();
     }
 
     // Accounts Payable (CxP)
     match /cuentas_por_pagar/{cxpId} {
-      allow get: if isValidId(cxpId);
-      allow list: if true;
-      allow create, update: if isValidId(cxpId) && isValidCuentaFinanciera(incoming());
-      allow delete: if isValidId(cxpId);
+      allow get: if isValidId(cxpId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(cxpId) && isAuthorizedStaff() && isValidCuentaFinanciera(incoming());
+      allow update: if isValidId(cxpId) && isAuthorizedStaff() && isValidCuentaFinanciera(incoming()) && (
+        isAdmin()
+        || (
+          existing().estado != 'pagada'
+          && incoming().diff(existing()).affectedKeys().hasOnly(['montoPagado', 'saldoRestante', 'estado', 'pagos', 'updatedAt'])
+        )
+      );
+      allow delete: if isValidId(cxpId) && isAdmin();
     }
 
     // Accounts Receivable (CxC)
     match /cuentas_por_cobrar/{cxcId} {
-      allow get: if isValidId(cxcId);
-      allow list: if true;
-      allow create, update: if isValidId(cxcId) && isValidCuentaFinanciera(incoming());
-      allow delete: if isValidId(cxcId);
+      allow get: if isValidId(cxcId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(cxcId) && isAuthorizedStaff() && isValidCuentaFinanciera(incoming());
+      allow update: if isValidId(cxcId) && isAuthorizedStaff() && isValidCuentaFinanciera(incoming()) && (
+        isAdmin()
+        || (
+          existing().estado != 'pagada'
+          && incoming().diff(existing()).affectedKeys().hasOnly(['montoPagado', 'saldoRestante', 'estado', 'abonos', 'updatedAt'])
+        )
+      );
+      allow delete: if isValidId(cxcId) && isAdmin();
     }
 
-    // Audit Logs: Strictly append-only, absolutely immutable
+    // Audit Logs: Strictly Append-Only & Immutable
     match /auditoria/{logId} {
-      allow get: if isValidId(logId);
-      allow list: if true;
-      allow create: if isValidId(logId) && isValidAuditoria(incoming());
-      allow update, delete: if false; // Bitácora 100% inmutable
-    }
-
-    // DEFAULT-DENY SAFETY NET: Catch-all to deny any undocumented collections
-    match /{document=**} {
-      allow read, write: if false;
+      allow get: if isValidId(logId) && isAuthorizedStaff();
+      allow list: if isAuthorizedStaff();
+      allow create: if isValidId(logId) && isAuthorizedStaff() && isValidAuditoria(incoming());
+      allow update, delete: if false;
     }
   }
 }

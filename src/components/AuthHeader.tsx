@@ -19,7 +19,8 @@ interface AuthHeaderProps {
   usuarios: Usuario[];
   sucursales: Sucursal[];
   empresaConfig?: EmpresaConfig;
-  onSelectUser: (user: Usuario) => void;
+  requireLogin?: boolean;
+  onSelectUser: (user: Usuario, verifiedPin?: string) => void;
   onLogout: () => void;
   onOpenHtmlModal?: () => void;
   onOpenClientStore?: () => void;
@@ -32,12 +33,20 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
   currentUser,
   usuarios,
   empresaConfig,
+  requireLogin = false,
   onSelectUser,
   onOpenCalculator,
   onOpenRateModal,
   onLoginAudit,
 }) => {
-  const [showLoginModal, setShowLoginModal] = useState(false);
+  const [showLoginModal, setShowLoginModal] = useState(Boolean(requireLogin && !currentUser));
+  const isMandatoryLogin = Boolean(requireLogin && !currentUser);
+
+  useEffect(() => {
+    if (isMandatoryLogin) {
+      setShowLoginModal(true);
+    }
+  }, [isMandatoryLogin]);
 
   // Filtrar usuarios de prueba heredados para que inicialmente sólo aparezca el Gerente General.
   // Cualquier usuario creado por el Gerente General en Configuración aparecerá aquí.
@@ -96,7 +105,7 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
     }
   }, [availableUsers, selectedUserId]);
 
-  // Auto-focus user selector on open & allow Escape to close login modal
+  // Auto-focus user selector on open & allow Escape to close login modal (unless login is mandatory)
   useEffect(() => {
     if (!showLoginModal) return;
 
@@ -105,7 +114,7 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
     });
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !isMandatoryLogin) {
         e.preventDefault();
         e.stopPropagation();
         setShowLoginModal(false);
@@ -117,7 +126,7 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
       cancelAnimationFrame(timer);
       window.removeEventListener('keydown', handleKeyDown, true);
     };
-  }, [showLoginModal]);
+  }, [showLoginModal, isMandatoryLogin]);
 
   // Keep selected user scrolled into view inside the list
   useEffect(() => {
@@ -213,7 +222,7 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
     if (isValid) {
       setFailedAttempts(0);
       setLockoutUntilMs(0);
-      onSelectUser(targetUser);
+      onSelectUser(targetUser, enteredPin.trim());
       if (onLoginAudit) {
         onLoginAudit(true, targetUser, 'Inicio de Sesión');
       }
@@ -338,15 +347,17 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
                   <p className="text-xs text-slate-400">Control de acceso seguro</p>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => setShowLoginModal(false)}
-                aria-label="Cerrar"
-                title="Cerrar (Esc)"
-                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
+              {!isMandatoryLogin && (
+                <button
+                  type="button"
+                  onClick={() => setShowLoginModal(false)}
+                  aria-label="Cerrar"
+                  title="Cerrar (Esc)"
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              )}
             </div>
 
             <form onSubmit={handleVerifyLogin} className="space-y-4">
@@ -450,13 +461,15 @@ export const AuthHeader: React.FC<AuthHeaderProps> = ({
               </div>
 
               <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
-                <button
-                  type="button"
-                  onClick={() => setShowLoginModal(false)}
-                  className="px-4 py-2 text-xs text-slate-400 hover:text-white cursor-pointer"
-                >
-                  Cancelar
-                </button>
+                {!isMandatoryLogin && (
+                  <button
+                    type="button"
+                    onClick={() => setShowLoginModal(false)}
+                    className="px-4 py-2 text-xs text-slate-400 hover:text-white cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                )}
                 <button
                   type="submit"
                   disabled={lockoutRemainingSec > 0}

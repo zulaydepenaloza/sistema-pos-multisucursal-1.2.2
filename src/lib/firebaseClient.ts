@@ -1,5 +1,13 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
+  getAuth,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut,
+  onAuthStateChanged,
+  User,
+} from 'firebase/auth';
+import {
   getFirestore,
   doc,
   getDoc,
@@ -45,6 +53,58 @@ export const firebaseConfig = {
 // Initialize Firebase App singleton
 export const firebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 
+// Initialize Firebase Authentication (Google Sign-In only)
+export const auth = getAuth(firebaseApp);
+
+export interface CloudAuthUser {
+  uid: string;
+  email: string | null;
+  displayName: string | null;
+  emailVerified: boolean;
+}
+
+function mapFirebaseUser(user: User | null): CloudAuthUser | null {
+  if (!user) return null;
+  return {
+    uid: user.uid,
+    email: user.email,
+    displayName: user.displayName,
+    emailVerified: Boolean(user.emailVerified),
+  };
+}
+
+export async function signInWithGoogleCloud(): Promise<{
+  success: boolean;
+  user?: CloudAuthUser | null;
+  error?: string;
+}> {
+  try {
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: 'select_account' });
+    const result = await signInWithPopup(auth, provider);
+    return { success: true, user: mapFirebaseUser(result.user) };
+  } catch (error: any) {
+    const code = error?.code || '';
+    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+      return { success: false, error: 'Inicio de sesión con Google cancelado.' };
+    }
+    return {
+      success: false,
+      error: error?.message || 'No se pudo autenticar con Google Cloud.',
+    };
+  }
+}
+
+export async function signOutGoogleCloud(): Promise<void> {
+  await signOut(auth);
+}
+
+export function subscribeToCloudAuth(onChanged: (user: CloudAuthUser | null) => void) {
+  return onAuthStateChanged(auth, (user) => {
+    onChanged(mapFirebaseUser(user));
+  });
+}
+
 // Initialize Firestore targeting the provisioned database ID
 export const db = getFirestore(
   firebaseApp,
@@ -63,17 +123,25 @@ enum OperationType {
 }
 
 function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const user = auth.currentUser;
   const errInfo = {
     error: error instanceof Error ? error.message : String(error),
     operationType,
     path,
     authInfo: {
-      userId: null,
-      email: null,
-      emailVerified: null,
-      isAnonymous: null,
-      tenantId: null,
-      providerInfo: [],
+      userId: user?.uid || null,
+      email: user?.email || null,
+      emailVerified: user ? user.emailVerified : null,
+      isAnonymous: user ? user.isAnonymous : null,
+      tenantId: user?.tenantId || null,
+      providerInfo: user
+        ? user.providerData.map((p) => ({
+            providerId: p.providerId,
+            displayName: p.displayName,
+            email: p.email,
+            photoUrl: p.photoURL,
+          }))
+        : [],
     },
   };
   console.error('Firestore Error: ', JSON.stringify(errInfo));
@@ -101,34 +169,43 @@ function stripUndefinedDeep<T>(value: T): T {
 }
 
 /**
- * Validates connection to Firestore server directly
+ * Validates connection to Firestore server directly (read-only ping)
  */
 export async function testFirestoreConnection(): Promise<{ success: boolean; message: string }> {
   try {
     const testDocRef = doc(db, 'test', 'connection');
-    await setDoc(testDocRef, { ping: Date.now(), timestamp: new Date().toISOString() }, { merge: true });
-    const snap = await getDocFromServer(testDocRef);
-    if (snap.exists()) {
-      return {
-        success: true,
-        message: '¡Conectado exitosamente con Firebase Firestore (Google Cloud)!',
-      };
-    }
+    await getDocFromServer(testDocRef);
     return {
       success: true,
-      message: 'Conexión verificada con el clúster de Firestore.',
+      message: auth.currentUser
+        ? `¡Conectado exitosamente con Firebase Firestore (${auth.currentUser.email || 'Google Cloud'})!`
+        : 'Conexión verificada con el clúster de Firestore.',
     };
   } catch (error: any) {
-    console.error('Firebase test connection error:', error);
-    if (error instanceof Error && error.message.includes('the client is offline')) {
+    const msg = error instanceof Error ? error.message : String(error);
+    const code = error?.code || '';
+    if (msg.includes('the client is offline')) {
       return {
         success: false,
         message: 'El dispositivo no tiene acceso a internet o la base de datos está desconectada.',
       };
     }
+    if (code === 'permission-denied' || msg.toLowerCase().includes('permission')) {
+      if (!auth.currentUser) {
+        return {
+          success: false,
+          message: 'Inicia sesión con Google en Configuración → Nube para conectar con Firestore.',
+        };
+      }
+      return {
+        success: false,
+        message: 'Permisos denegados en Firestore para la cuenta de Google actual.',
+      };
+    }
+    console.error('Firebase test connection error:', error);
     return {
       success: false,
-      message: `Error al conectar con Firestore: ${error?.message || error}`,
+      message: `Error al conectar con Firestore: ${msg}`,
     };
   }
 }
@@ -504,16 +581,6 @@ export async function saveInventarioToFirestore(
       );
     }
 
-    // Keep legacy main doc updated for backwards compatibility
-    batch.set(
-      doc(db, 'inventario', 'main'),
-      {
-        items: inventario,
-        updatedAt: new Date().toISOString(),
-      },
-      { merge: true }
-    );
-
     await batch.commit();
     return true;
   } catch (err) {
@@ -658,10 +725,10 @@ export async function fetchAllFromFirestore(): Promise<{
       result.tiendaConfig = tiendaSnap.data() as TiendaConfig;
     }
 
-    // 3. Fetch inventario
-    const invSnap = await getDoc(doc(db, 'inventario', 'main'));
-    if (invSnap.exists() && Array.isArray(invSnap.data().items)) {
-      result.inventario = invSnap.data().items;
+    // 3. Fetch inventario (reconciled per-branch documents)
+    const invConsolidated = await fetchInventarioFromFirestore();
+    if (invConsolidated && invConsolidated.length > 0) {
+      result.inventario = invConsolidated;
     }
 
     // 4. Fetch productos
@@ -695,33 +762,70 @@ export interface TransaccionVentaInput {
   venta: Venta;
   sucursalId: number;
   items: { producto: Producto; cantidad: number }[];
+  txUid?: string;
 }
 
 export interface TransaccionVentaResult {
   success: boolean;
   ventaDocId?: string;
+  alreadyProcessed?: boolean;
   error?: string;
   stockFaltante?: { productoId: number; nombre: string; stockDisponible: number; requerido: number }[];
   isOffline?: boolean;
 }
 
 /**
+ * Consolida líneas duplicadas del carrito para el mismo producto antes de validar/descontar.
+ */
+export function consolidateSaleItems(
+  items: { producto: Producto; cantidad: number }[]
+): { producto: Producto; cantidad: number }[] {
+  const map = new Map<number, { producto: Producto; cantidad: number }>();
+  for (const line of items) {
+    if (!line?.producto || !(Number(line.cantidad) > 0)) continue;
+    const qty = Number(line.cantidad);
+    const existing = map.get(line.producto.id);
+    if (existing) {
+      existing.cantidad = +(existing.cantidad + qty).toFixed(3);
+    } else {
+      map.set(line.producto.id, { producto: line.producto, cantidad: qty });
+    }
+  }
+  return Array.from(map.values());
+}
+
+/**
  * Transacción Atómica de Venta:
- * Bloquea y verifica el stock disponible en la sucursal antes de vender.
- * Evita la sobreventa concurrente de dos cajas vendiendo las últimas unidades.
- * Si no hay stock suficiente, aborta la transacción y devuelve el detalle exacto.
+ * - Idempotente por txUid (si la venta ya existe en Firestore, evita doble descuento).
+ * - Consolida líneas repetidas por producto antes de validar y descontar stock.
+ * - Bloquea y verifica el stock disponible en la sucursal antes de vender.
  */
 export async function registrarVentaTransaccional(
   input: TransaccionVentaInput
 ): Promise<TransaccionVentaResult> {
-  const { venta, sucursalId, items } = input;
+  const { venta, sucursalId, items, txUid } = input;
+  const consolidatedItems = consolidateSaleItems(items);
+  const resolvedTxUid = String(
+    txUid || (venta as any).txUid || venta.id || Date.now()
+  ).replace(/[^a-zA-Z0-9_\-]/g, '_');
+
   const branchDocRef = doc(db, 'inventario', `sucursal_${sucursalId}`);
-  const ventaDocId = `vta_${sucursalId}_${venta.id || Date.now()}`;
+  const ventaDocId = `vta_${sucursalId}_${resolvedTxUid}`;
   const ventaDocRef = doc(db, 'ventas', ventaDocId);
 
   try {
     const result = await runTransaction(db, async (transaction) => {
-      // 1. Leer el inventario actual de la sucursal
+      // 1. Verificar idempotencia antes de tocar inventario
+      const existingVentaSnap = await transaction.get(ventaDocRef);
+      if (existingVentaSnap.exists()) {
+        return {
+          success: true,
+          ventaDocId,
+          alreadyProcessed: true,
+        };
+      }
+
+      // 2. Leer el inventario actual de la sucursal
       const branchSnap = await transaction.get(branchDocRef);
       let branchItems: InventarioItem[] = [];
 
@@ -729,10 +833,10 @@ export async function registrarVentaTransaccional(
         branchItems = branchSnap.data().items as InventarioItem[];
       }
 
-      // 2. Validar existencias concurrentes para cada producto
+      // 3. Validar existencias concurrentes consolidadas por producto
       const faltantes: { productoId: number; nombre: string; stockDisponible: number; requerido: number }[] = [];
 
-      for (const item of items) {
+      for (const item of consolidatedItems) {
         const invItem = branchItems.find((i) => i.producto_id === item.producto.id);
         const currentStock = invItem ? invItem.stock : 0;
         if (currentStock < item.cantidad) {
@@ -749,33 +853,37 @@ export async function registrarVentaTransaccional(
         throw new Error(`STOCK_INSUFICIENTE:${JSON.stringify(faltantes)}`);
       }
 
-      // 3. Descontar el inventario de manera atómica
+      // 4. Descontar el inventario consolidado de manera atómica
+      const qtyByProduct = new Map<number, number>(
+        consolidatedItems.map((i) => [i.producto.id, i.cantidad])
+      );
       const updatedItems = branchItems.map((invItem) => {
-        const soldItem = items.find((i) => i.producto.id === invItem.producto_id);
-        if (soldItem) {
+        const soldQty = qtyByProduct.get(invItem.producto_id);
+        if (soldQty !== undefined) {
           return {
             ...invItem,
-            stock: Math.max(0, +(invItem.stock - soldItem.cantidad).toFixed(3)),
+            stock: Math.max(0, +(invItem.stock - soldQty).toFixed(3)),
           };
         }
         return invItem;
       });
 
-      // 4. Preparar el documento de venta inmutable y limpio
+      // 5. Preparar el documento de venta inmutable y limpio
       const numeroFactura =
         (venta as any).numeroFactura ||
         `FAC-${String(sucursalId).padStart(2, '0')}-${String(venta.id).padStart(6, '0')}`;
 
-      const cleanVenta: Record<string, any> = {
+      const cleanVenta: Record<string, any> = stripUndefinedDeep({
         ...venta,
+        txUid: resolvedTxUid,
         numeroFactura,
         id: venta.id,
         sucursal_id: sucursalId,
         fecha: venta.fecha || new Date().toISOString(),
         total: Number(venta.total) || 0,
-      };
+      });
 
-      // 5. Registrar venta y actualizar inventario en el mismo batch atómico
+      // 6. Registrar venta y actualizar inventario en el mismo batch atómico
       transaction.set(ventaDocRef, cleanVenta);
       transaction.set(
         branchDocRef,
@@ -788,8 +896,8 @@ export async function registrarVentaTransaccional(
         { merge: true }
       );
 
-      // 6. Registrar bitácora de auditoría atómica
-      const auditDocId = `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      // 7. Registrar bitácora de auditoría atómica
+      const auditDocId = `aud_vta_${resolvedTxUid}`;
       const auditRef = doc(db, 'auditoria', auditDocId);
       transaction.set(auditRef, {
         id: auditDocId,
@@ -803,6 +911,7 @@ export async function registrarVentaTransaccional(
       return {
         success: true,
         ventaDocId,
+        alreadyProcessed: false,
       };
     });
 

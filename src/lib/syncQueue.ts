@@ -8,7 +8,8 @@ export type SyncOpType =
   | 'firestore_delete_product'
   | 'firestore_inventario'
   | 'firestore_sucursales'
-  | 'firestore_usuarios';
+  | 'firestore_usuarios'
+  | 'firestore_venta';
 
 export interface PendingSyncOp {
   opId: string;

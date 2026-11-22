@@ -607,6 +607,20 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({
                   </div>
                 </div>
 
+                {parseResult.warnings && parseResult.warnings.length > 0 && (
+                  <div className="bg-amber-950/50 border border-amber-500/40 rounded-lg p-2.5 text-[11px] text-amber-200 space-y-1">
+                    <div className="font-bold text-amber-300 flex items-center gap-1.5">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                      <span>Advertencia de registros omitidos durante la validación:</span>
+                    </div>
+                    <ul className="list-disc list-inside space-y-0.5 text-amber-200/90 pl-1">
+                      {parseResult.warnings.map((w, idx) => (
+                        <li key={idx}>{w}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
                 {/* Safety Checkbox */}
                 <div className="pt-2 border-t border-slate-800/80 space-y-2">
                   <label className="flex items-start gap-2 cursor-pointer text-slate-300 text-[11px]">

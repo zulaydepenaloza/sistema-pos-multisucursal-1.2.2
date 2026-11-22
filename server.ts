@@ -26,6 +26,7 @@ interface ServerDatabase {
   inventario: any[] | null;
   factoryResetAt?: string | null;
   adminPinHashes?: Record<string, string>;
+  userPinHashes?: Record<string, string>;
 }
 
 function parseIsoMsServer(val: unknown): number {
@@ -135,12 +136,15 @@ const FORBIDDEN_KEYS = new Set([
 
 let cachedSessionSecret: string | null = null;
 export function getOrInitSessionSecret(): string {
-  if (cachedSessionSecret) return cachedSessionSecret;
   const fromEnv = (process.env.SESSION_SECRET || process.env.JWT_SECRET || '').trim();
   if (fromEnv && fromEnv.length >= 16) {
     cachedSessionSecret = fromEnv;
     return cachedSessionSecret;
   }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('SESSION_SECRET no configurado en producción.');
+  }
+  if (cachedSessionSecret) return cachedSessionSecret;
   try {
     if (!fs.existsSync(DB_DIR)) {
       fs.mkdirSync(DB_DIR, { recursive: true });
@@ -169,14 +173,20 @@ export function timingSafeEqualStr(a: string, b: string): boolean {
 }
 
 function getConfiguredDevSecret(): string {
-  return (process.env.ADMIN_DEV_KEY || 'OmniPosDev2026MasterKey').trim();
+  return (process.env.ADMIN_DEV_KEY || '').trim();
+}
+
+export function isDevSecretConfigured(): boolean {
+  return getConfiguredDevSecret().length > 0;
 }
 
 export function verifyDevToken(rawToken?: string | null): boolean {
+  const configured = getConfiguredDevSecret();
+  if (!configured) return false;
   if (!rawToken || typeof rawToken !== 'string') return false;
   const clean = rawToken.trim();
   if (!clean) return false;
-  return timingSafeEqualStr(clean, getConfiguredDevSecret());
+  return timingSafeEqualStr(clean, configured);
 }
 
 export function hashPinServer(pin: string): string {
@@ -482,6 +492,7 @@ app.post('/api/auth/pos-session', authRateLimiter, (req, res) => {
     const numId = Number(userId);
     const cleanRol = typeof rol === 'string' ? rol.trim() : '';
     const cleanMachine = typeof machineId === 'string' ? machineId.trim().slice(0, 120) : '';
+    const cleanPin = typeof pin === 'string' ? pin.trim() : '';
 
     if (!Number.isFinite(numId) || numId <= 0 || !VALID_ROLES.has(cleanRol) || cleanMachine.length < 4) {
       return res.status(400).json({
@@ -492,14 +503,28 @@ app.post('/api/auth/pos-session', authRateLimiter, (req, res) => {
 
     const db = readServerDb();
     let pinVerified = false;
-    if (typeof pin === 'string' && pin.trim().length > 0) {
-      const storedHash = db.adminPinHashes?.[String(numId)];
-      if (storedHash) {
-        if (!verifyPinAgainstHash(pin, storedHash)) {
-          auditSecurityEvent(req, 'FAILED_POS_SESSION_PIN', `userId=${numId}`);
+    const storedHash =
+      db.userPinHashes?.[String(numId)] ||
+      db.adminPinHashes?.[String(numId)] ||
+      '';
+
+    if (storedHash) {
+      if (!cleanPin || !verifyPinAgainstHash(cleanPin, storedHash)) {
+        auditSecurityEvent(req, 'FAILED_POS_SESSION_PIN', `userId=${numId}`);
+        return res.status(401).json({
+          success: false,
+          error: 'PIN requerido o incorrecto para iniciar sesión.',
+        });
+      }
+      pinVerified = true;
+    } else if (cleanRol === 'admin') {
+      const knownAdminHashes = Object.values(db.adminPinHashes || {}).filter((h) => /^[a-f0-9]{64}$/i.test(h));
+      if (knownAdminHashes.length > 0) {
+        if (!cleanPin || !knownAdminHashes.some((h) => verifyPinAgainstHash(cleanPin, h))) {
+          auditSecurityEvent(req, 'FAILED_ADMIN_SESSION_PIN', `userId=${numId}`);
           return res.status(401).json({
             success: false,
-            error: 'PIN incorrecto para iniciar sesión.',
+            error: 'Se requiere PIN válido de Administrador para iniciar sesión administrativa.',
           });
         }
         pinVerified = true;
@@ -609,8 +634,8 @@ app.get('/api/bcv-rate', async (req, res) => {
   }
 });
 
-// API: Obtener todos los pedidos web / online
-app.get('/api/pedidos', (req, res) => {
+// API: Obtener todos los pedidos web / online (Requiere sesión POS autenticada)
+app.get('/api/pedidos', requirePosSession(['admin', 'supervisor', 'cajero', 'inventario']), (req, res) => {
   try {
     const db = readServerDb();
     res.json({ success: true, pedidos: db.pedidos || [] });
@@ -722,8 +747,71 @@ app.patch('/api/pedidos/:id', requirePosSession(['admin', 'supervisor', 'cajero'
   }
 });
 
-// API: Sincronización de estado general entre dispositivos (productos, tasa, config, sucursales)
-app.get('/api/sync/state', (req, res) => {
+// API Pública Sanitizada para la Tienda Web (?vista=tienda): solo catálogo público, sucursales, stock y tasa (sin pedidos ni PII)
+app.get('/api/public/store-state', (req, res) => {
+  try {
+    const db = readServerDb();
+    const safeProductos = Array.isArray(db.productos)
+      ? db.productos.map((p: any) => ({
+          id: p.id,
+          codigo_barras: p.codigo_barras || '',
+          nombre: p.nombre || '',
+          categoria: p.categoria || '',
+          unidad_medida: p.unidad_medida || 'UND',
+          descripcion: p.descripcion || '',
+          precio: Number(p.precio) || 0,
+          exento_iva: Boolean(p.exento_iva),
+          destacadoTienda: Boolean(p.destacadoTienda),
+          imagen: p.imagen || '',
+        }))
+      : null;
+
+    const safeSucursales = Array.isArray(db.sucursales)
+      ? db.sucursales.map((s: any) => ({
+          id: s.id,
+          nombre: s.nombre || '',
+          tipo: s.tipo || 'tienda',
+        }))
+      : null;
+
+    const safeInventario = Array.isArray(db.inventario)
+      ? db.inventario.map((i: any) => ({
+          id: Number(i.id) || 0,
+          producto_id: i.producto_id,
+          sucursal_id: i.sucursal_id,
+          stock: Number(i.stock ?? i.cantidad) || 0,
+        }))
+      : null;
+
+    const safeEmpresaConfig = db.empresaConfig
+      ? {
+          nombreEmpresa: db.empresaConfig.nombreEmpresa || '',
+          tasaCambio: Number(db.empresaConfig.tasaCambio) || 0,
+          fechaTasa: db.empresaConfig.fechaTasa || '',
+          ultimaActualizacionTasa: db.empresaConfig.ultimaActualizacionTasa || '',
+          factoryResetAt: db.empresaConfig.factoryResetAt || db.factoryResetAt || '',
+          nombreTienda1: db.empresaConfig.nombreTienda1 || '',
+          nombreTienda2: db.empresaConfig.nombreTienda2 || '',
+          nombreOficina: db.empresaConfig.nombreOficina || '',
+        }
+      : null;
+
+    res.json({
+      success: true,
+      empresaConfig: safeEmpresaConfig,
+      tiendaConfig: db.tiendaConfig ? sanitizeRecordKeys(db.tiendaConfig) : null,
+      sucursales: safeSucursales,
+      productos: safeProductos,
+      inventario: safeInventario,
+      factoryResetAt: db.factoryResetAt || null,
+    });
+  } catch {
+    res.status(500).json({ success: false, error: 'Error interno al consultar catálogo de tienda.' });
+  }
+});
+
+// API: Sincronización de estado general entre dispositivos (Protegida por sesión POS)
+app.get('/api/sync/state', requirePosSession(['admin', 'supervisor', 'cajero', 'inventario']), (req, res) => {
   try {
     const db = readServerDb();
     res.json({
@@ -747,7 +835,18 @@ app.post('/api/sync/state', requirePosSession(['admin', 'supervisor', 'cajero', 
       return res.status(400).json({ success: false, error: 'Cuerpo de sincronización inválido.' });
     }
 
-    const { empresaConfig, tiendaConfig, sucursales, productos, inventario, pedidos, replacePedidos, clientFactoryResetAt, adminPinHashes } = req.body;
+    const {
+      empresaConfig,
+      tiendaConfig,
+      sucursales,
+      productos,
+      inventario,
+      pedidos,
+      replacePedidos,
+      clientFactoryResetAt,
+      adminPinHashes,
+      userPinHashes,
+    } = req.body;
     const db = readServerDb();
 
     const serverResetMs = parseIsoMsServer(db.factoryResetAt || db.empresaConfig?.factoryResetAt);
@@ -798,22 +897,41 @@ app.post('/api/sync/state', requirePosSession(['admin', 'supervisor', 'cajero', 
       }
     }
 
-    // Store admin PIN hashes strictly server-side for factory-reset/admin session verification (never exposed in GET /api/sync/state)
+    // Store PIN hashes strictly server-side for session/factory-reset verification (never exposed in GET)
     const session = (req as any).posSession;
-    if (session?.rol === 'admin' && Array.isArray(adminPinHashes)) {
-      const nextHashes: Record<string, string> = {};
-      for (const entry of adminPinHashes) {
-        if (
-          entry &&
-          entry.id !== undefined &&
-          typeof entry.pinHash === 'string' &&
-          /^[a-f0-9]{64}$/i.test(entry.pinHash.trim())
-        ) {
-          nextHashes[String(entry.id)] = entry.pinHash.trim().toLowerCase();
+    if (session?.rol === 'admin') {
+      if (Array.isArray(adminPinHashes)) {
+        const nextHashes: Record<string, string> = {};
+        for (const entry of adminPinHashes) {
+          if (
+            entry &&
+            entry.id !== undefined &&
+            typeof entry.pinHash === 'string' &&
+            /^[a-f0-9]{64}$/i.test(entry.pinHash.trim())
+          ) {
+            nextHashes[String(entry.id)] = entry.pinHash.trim().toLowerCase();
+          }
+        }
+        if (Object.keys(nextHashes).length > 0) {
+          db.adminPinHashes = nextHashes;
         }
       }
-      if (Object.keys(nextHashes).length > 0) {
-        db.adminPinHashes = nextHashes;
+
+      if (Array.isArray(userPinHashes)) {
+        const nextUserHashes: Record<string, string> = {};
+        for (const entry of userPinHashes) {
+          if (
+            entry &&
+            entry.id !== undefined &&
+            typeof entry.pinHash === 'string' &&
+            /^[a-f0-9]{64}$/i.test(entry.pinHash.trim())
+          ) {
+            nextUserHashes[String(entry.id)] = entry.pinHash.trim().toLowerCase();
+          }
+        }
+        if (Object.keys(nextUserHashes).length > 0) {
+          db.userPinHashes = nextUserHashes;
+        }
       }
     }
 
@@ -872,7 +990,7 @@ app.post('/api/system/factory-reset', resetRateLimiter, requirePosSession(['admi
       productos: [],
       inventario: [],
       factoryResetAt: resetStamp,
-      ...(db.adminPinHashes ? { adminPinHashes: db.adminPinHashes } : {}),
+      ...(db.adminPinHashes ? { adminPinHashes: db.adminPinHashes, userPinHashes: { ...db.adminPinHashes } } : {}),
     };
     saveServerDb(cleanDb);
     auditSecurityEvent(req, 'FACTORY_RESET_EXECUTED', `stamp=${resetStamp}`);
@@ -883,9 +1001,16 @@ app.post('/api/system/factory-reset', resetRateLimiter, requirePosSession(['admi
   }
 });
 
-// API: Verificación de Token Maestro de Desarrollador (para operaciones protegidas como agregar sucursales)
+// API: Verificación de Token Maestro de Desarrollador (fail-closed si ADMIN_DEV_KEY no está configurado)
 app.post('/api/developer/verify-token', authRateLimiter, licenseRateLimiter, (req, res) => {
   try {
+    if (!isDevSecretConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Servicio de desarrollador no configurado en el servidor (ADMIN_DEV_KEY faltante en Secrets).',
+      });
+    }
+
     const rawToken =
       (req.body && typeof req.body.token === 'string' ? req.body.token : '') ||
       (typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'] : '');
@@ -913,9 +1038,16 @@ app.post('/api/developer/verify-token', authRateLimiter, licenseRateLimiter, (re
   }
 });
 
-// Download full repository as a .zip file (Protected - header token only, no query string secret exposure)
+// Download full repository as a .zip file (Protected - header token only, fail-closed)
 app.get('/api/download-zip', (req, res) => {
   try {
+    if (!isDevSecretConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Descarga deshabilitada: ADMIN_DEV_KEY no configurado en el servidor.',
+      });
+    }
+
     const devToken = typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'] : '';
 
     if (!verifyDevToken(devToken)) {
@@ -971,22 +1103,38 @@ app.get('/api/download-zip', (req, res) => {
   }
 });
 
-// Ed25519 Asymmetric Cryptographic Signing Keys (Private Key strictly kept on Server)
-const ED25519_SECRET_KEY_HEX =
-  process.env.DEV_LICENSE_ED25519_SECRET_KEY ||
-  '50cbb06d4a2028f3c629ac174add60e0cea17976d10318569b571096f04b1b707ed10863ff7693b72c2c351ce688d2c55c0dda497a32e43b4603919921475431';
+// Ed25519 Asymmetric Cryptographic Signing Key (Private Key strictly from Server Secrets — NEVER hardcoded)
+function getConfiguredEd25519SecretKey(): string {
+  return (process.env.DEV_LICENSE_ED25519_SECRET_KEY || '').trim();
+}
+
+export function isLicenseSigningConfigured(): boolean {
+  const keyHex = getConfiguredEd25519SecretKey();
+  return /^[0-9a-fA-F]{128}$/.test(keyHex);
+}
 
 function signLicensePayloadEd25519(base64Payload: string, machineId: string): string {
-  const secretKeyBytes = Uint8Array.from(Buffer.from(ED25519_SECRET_KEY_HEX, 'hex'));
+  const keyHex = getConfiguredEd25519SecretKey();
+  if (!/^[0-9a-fA-F]{128}$/.test(keyHex)) {
+    throw new Error('LICENSE_SIGNING_NOT_CONFIGURED');
+  }
+  const secretKeyBytes = Uint8Array.from(Buffer.from(keyHex, 'hex'));
   const messageStr = `${base64Payload}::${machineId.trim().toUpperCase()}`;
   const messageBytes = Uint8Array.from(Buffer.from(messageStr, 'utf-8'));
   const signatureBytes = nacl.sign.detached(messageBytes, secretKeyBytes);
   return Buffer.from(signatureBytes).toString('hex');
 }
 
-// Protected Developer License Generator Endpoint (Requires Master Developer Secret)
+// Protected Developer License Generator Endpoint (Requires Master Developer Secret + Ed25519 Secret Key)
 app.post('/api/developer/license/generate', authRateLimiter, licenseRateLimiter, (req, res) => {
   try {
+    if (!isDevSecretConfigured() || !isLicenseSigningConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Servicio de emisión de licencias no configurado (configure ADMIN_DEV_KEY y DEV_LICENSE_ED25519_SECRET_KEY en Secrets).',
+      });
+    }
+
     const { machineId, empresa, rif, tipo, fechaEmision, fechaVencimiento, cajasMax, sucursalesMax, devSecret } = req.body || {};
     const token =
       (typeof devSecret === 'string' && devSecret) ||
@@ -1022,34 +1170,39 @@ app.post('/api/developer/license/generate', authRateLimiter, licenseRateLimiter,
       .replace(/\//g, '_')
       .replace(/=+$/, '');
 
-    // 1. Modern Ed25519 Asymmetric Digital Signature (64-byte un-truncated signature)
+    // Ed25519 Asymmetric Digital Signature (64-byte un-truncated signature; no legacy LIC- issuance)
     const ed25519SigHex = signLicensePayloadEd25519(base64Payload, payload.machineId);
     const activationKey = `ED2-${base64Payload}.${ed25519SigHex}`;
-
-    // 2. Legacy signature for backwards compatibility / migration
-    const legacySecret = process.env.LICENSE_MASTER_KEY || 'POS_CRYPT_SEC_KEY_VAL_2026_MULTI_BRANCH_LATAM_G82X';
-    const legacyHash = crypto.createHash('sha256')
-      .update(`${base64Payload}::${legacySecret}::${payload.machineId}`)
-      .digest('hex');
-    const legacyKey = `LIC-${base64Payload}.${legacyHash.substring(0, 16).toUpperCase()}`;
 
     return res.json({
       success: true,
       key: activationKey,
-      legacyKey,
       payload,
       algorithm: 'Ed25519 Asymmetric Digital Signature',
     });
   } catch (err: any) {
+    if (String(err?.message) === 'LICENSE_SIGNING_NOT_CONFIGURED') {
+      return res.status(503).json({
+        success: false,
+        error: 'Servicio de firma de licencias Ed25519 no configurado en el servidor.',
+      });
+    }
     console.error('Error generating developer license:', err);
     return res.status(500).json({ success: false, error: 'Error interno al generar licencia.' });
   }
 });
 
-// Official Trial / Demo License Endpoint (15 days evaluation)
+// Official Trial / Demo License Endpoint (15 days evaluation - fail-closed if signing key missing)
 app.post('/api/developer/license/trial', licenseRateLimiter, (req, res) => {
   try {
-    const { machineId, empresa, rif } = req.body;
+    if (!isLicenseSigningConfigured()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Emisión oficial de licencias de prueba no configurada (DEV_LICENSE_ED25519_SECRET_KEY faltante).',
+      });
+    }
+
+    const { machineId, empresa, rif } = req.body || {};
     if (!machineId) {
       return res.status(400).json({ success: false, error: 'machineId es requerido para el período de prueba.' });
     }
@@ -1592,8 +1745,8 @@ async function startServer() {
     });
   }
 
-  if (!process.env.ADMIN_DEV_KEY) {
-    console.warn('[SECURITY NOTICE] Variable ADMIN_DEV_KEY no definida; usando clave de desarrollo local únicamente en backend.');
+  if (!isDevSecretConfigured() || !isLicenseSigningConfigured()) {
+    console.warn('[SECURITY NOTICE] ADMIN_DEV_KEY o DEV_LICENSE_ED25519_SECRET_KEY no están configuradas — endpoints de desarrollador y licencias deshabilitados (fail-closed HTTP 503).');
   }
 
   app.listen(PORT, '0.0.0.0', () => {

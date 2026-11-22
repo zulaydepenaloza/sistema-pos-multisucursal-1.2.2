@@ -24,6 +24,7 @@ import {
   LicenseValidationResult,
   LicensePayload,
 } from '../lib/licensing';
+import { fetchApi } from '../lib/apiFetch';
 
 interface LicenseLockModalProps {
   validationResult: LicenseValidationResult;
@@ -134,7 +135,7 @@ export const LicenseLockModal: React.FC<LicenseLockModalProps> = ({
     };
 
     try {
-      const resp = await fetch('/api/developer/license/generate', {
+      const resp = await fetchApi('/api/developer/license/generate', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -157,11 +158,18 @@ export const LicenseLockModal: React.FC<LicenseLockModalProps> = ({
       }
 
       if (!resp.ok) {
+        const wasRedirectedToGet =
+          resp.status === 404 &&
+          (resp.redirected ||
+            (typeof data?.error === 'string' && data.error.includes('Ruta de API no encontrada: GET ')));
+
         setErrorMsg(
-          data?.error ||
-            (resp.status === 401 || resp.status === 403
-              ? 'Credencial de soporte rechazada por el servidor.'
-              : `Error del servidor al emitir licencia (HTTP ${resp.status}).`)
+          wasRedirectedToGet
+            ? 'El proxy de la vista previa redirigió la solicitud POST como GET (cookies bloqueadas o sesión expirada en iframe). Abre la aplicación en una pestaña directa o recarga la página (F5) e intenta nuevamente.'
+            : data?.error ||
+                (resp.status === 401 || resp.status === 403
+                  ? 'Credencial de soporte rechazada por el servidor (verifica ADMIN_DEV_KEY en Secrets).'
+                  : `Error del servidor al emitir licencia (HTTP ${resp.status}).`)
         );
         setIsSubmittingSupport(false);
         return;
@@ -300,7 +308,7 @@ export const LicenseLockModal: React.FC<LicenseLockModalProps> = ({
                 <KeyRound className="w-3.5 h-3.5 text-amber-400" />
                 Clave de Activación Criptográfica:
               </span>
-              <span className="text-[11px] text-slate-400 font-mono">Formato ED2-... o LIC-...</span>
+              <span className="text-[11px] text-slate-400 font-mono">Formato ED2-... o DEMO-...</span>
             </label>
             <textarea
               rows={3}
@@ -375,10 +383,12 @@ export const LicenseLockModal: React.FC<LicenseLockModalProps> = ({
                 </p>
 
                 <div>
-                  <label className="text-[10px] text-slate-400 block mb-1">Credencial Secreta de Desarrollador:</label>
+                  <label className="text-[10px] text-slate-400 block mb-1">
+                    Credencial Secreta de Desarrollador (ADMIN_DEV_KEY en Secrets):
+                  </label>
                   <input
                     type="password"
-                    placeholder="Token de autorización..."
+                    placeholder="Ingresa el valor configurado en ADMIN_DEV_KEY..."
                     value={devSecretKey}
                     onChange={(e) => setDevSecretKey(e.target.value)}
                     className="w-full bg-slate-900 border border-slate-700 text-xs px-3 py-2 rounded-lg text-white font-mono placeholder:text-slate-600 focus:outline-none focus:border-indigo-500"

@@ -14,6 +14,7 @@ import {
   Save,
   UserCheck,
   ShieldAlert,
+  ShieldCheck,
   Sliders,
   DollarSign,
   Lock,
@@ -54,7 +55,16 @@ import { AuditoriaView } from './AuditoriaView';
 import { LicenseManagerView } from './LicenseManagerView';
 import { LicenseValidationResult } from '../lib/licensing';
 import { BackupRestoreView } from './BackupRestoreView';
-import { testFirestoreConnection, syncAllToFirestore, fetchAllFromFirestore } from '../lib/firebaseClient';
+import {
+  testFirestoreConnection,
+  syncAllToFirestore,
+  fetchAllFromFirestore,
+  subscribeToCloudAuth,
+  signInWithGoogleCloud,
+  signOutGoogleCloud,
+  CloudAuthUser,
+} from '../lib/firebaseClient';
+import { fetchApi } from '../lib/apiFetch';
 import {
   hashPin,
   isHashedPin,
@@ -100,7 +110,12 @@ interface ConfiguracionViewProps {
   onOpenCalculator?: () => void;
   onOpenStoreShare?: () => void;
   onOpenHtmlModal?: () => void;
-  onDataLoadedFromCloud?: (data: { productos?: Producto[]; empresaConfig?: EmpresaConfig; tiendaConfig?: TiendaConfig }) => void;
+  onDataLoadedFromCloud?: (data: {
+    productos?: Producto[];
+    inventario?: InventarioItem[];
+    empresaConfig?: EmpresaConfig;
+    tiendaConfig?: TiendaConfig;
+  }) => void;
 }
 
 export const ConfiguracionView: React.FC<ConfiguracionViewProps> = ({
@@ -145,26 +160,60 @@ export const ConfiguracionView: React.FC<ConfiguracionViewProps> = ({
     isConnected: null,
     message: 'Listo para comprobar conexión con Google Cloud Firestore.',
   });
+  const [cloudUser, setCloudUser] = useState<CloudAuthUser | null>(null);
+  const [isSigningInCloud, setIsSigningInCloud] = useState<boolean>(false);
   const [isTestingCloud, setIsTestingCloud] = useState<boolean>(false);
   const [isSyncingCloud, setIsSyncingCloud] = useState<boolean>(false);
   const [isDownloadingCloud, setIsDownloadingCloud] = useState<boolean>(false);
   const [cloudNotice, setCloudNotice] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   React.useEffect(() => {
-    testFirestoreConnection()
-      .then((res) => {
-        setCloudStatus({
-          isConnected: res.success,
-          message: res.message,
-        });
-      })
-      .catch(() => {
+    const unsub = subscribeToCloudAuth((user) => {
+      setCloudUser(user);
+      if (user?.emailVerified) {
+        testFirestoreConnection()
+          .then((res) => {
+            setCloudStatus({
+              isConnected: res.success,
+              message: res.message,
+            });
+          })
+          .catch(() => {
+            setCloudStatus({
+              isConnected: false,
+              message: 'Sin conexión directa a Firestore',
+            });
+          });
+      } else {
         setCloudStatus({
           isConnected: false,
-          message: 'Sin conexión directa a Firestore',
+          message: 'Inicia sesión con Google para habilitar sincronización con Firestore.',
         });
-      });
+      }
+    });
+    return () => unsub();
   }, []);
+
+  const handleGoogleCloudSignIn = async () => {
+    setIsSigningInCloud(true);
+    setCloudNotice(null);
+    const res = await signInWithGoogleCloud();
+    setIsSigningInCloud(false);
+    if (res.success && res.user) {
+      setCloudNotice({
+        type: 'success',
+        text: `Cuenta Google conectada: ${res.user.email || res.user.displayName}`,
+      });
+    } else if (res.error) {
+      setCloudNotice({ type: 'error', text: res.error });
+    }
+  };
+
+  const handleGoogleCloudSignOut = async () => {
+    await signOutGoogleCloud();
+    setCloudStatus({ isConnected: false, message: 'Sesión Cloud desconectada.' });
+    setCloudNotice({ type: 'info', text: 'Sesión de Google Cloud cerrada correctamente.' });
+  };
 
   const handleTestCloudPing = async () => {
     setIsTestingCloud(true);
@@ -797,7 +846,7 @@ export const ConfiguracionView: React.FC<ConfiguracionViewProps> = ({
     setIsVerifyingDevToken(true);
     setAddSucursalError(null);
     try {
-      const response = await fetch('/api/developer/verify-token', {
+      const response = await fetchApi('/api/developer/verify-token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: cleanToken }),
@@ -2200,8 +2249,31 @@ export const ConfiguracionView: React.FC<ConfiguracionViewProps> = ({
                 </div>
               </div>
 
-              {/* Status Badge & Latency Ping */}
-              <div className="flex items-center gap-2">
+              {/* Status Badge & Google Auth */}
+              <div className="flex flex-wrap items-center gap-2">
+                {cloudUser ? (
+                  <button
+                    type="button"
+                    onClick={handleGoogleCloudSignOut}
+                    className="px-3.5 py-2 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/40 text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5"
+                    title="Cerrar sesión de Google Cloud"
+                  >
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    <span className="max-w-[180px] truncate">{cloudUser.email || 'Google Conectado'}</span>
+                    <span className="text-[10px] opacity-75">(Salir)</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleGoogleCloudSignIn}
+                    disabled={isSigningInCloud}
+                    className="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black transition-all cursor-pointer flex items-center gap-1.5 shadow-md disabled:opacity-50"
+                  >
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>{isSigningInCloud ? 'Autenticando...' : 'Conectar con Google (Cloud)'}</span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={handleTestCloudPing}
@@ -2241,13 +2313,15 @@ export const ConfiguracionView: React.FC<ConfiguracionViewProps> = ({
                 >
                   {cloudStatus.isConnected === true
                     ? 'Conectado a Google Cloud (Clúster Activo)'
+                    : !cloudUser
+                    ? 'Requiere Conectar con Google para Sincronizar'
                     : cloudStatus.isConnected === false
                     ? 'Sin Conexión Directa (Modo Local Activo)'
                     : 'Listo para comprobar'}
                 </span>
               </div>
               <div className="text-[11px] text-slate-400 font-mono">
-                Proyecto: <span className="text-cyan-300 font-bold">ai-studio-sistemamultisucu</span>
+                Proyecto: <span className="text-cyan-300 font-bold">composed-keep-9v9wh</span>
               </div>
             </div>
           </div>
